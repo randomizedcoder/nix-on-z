@@ -31,18 +31,21 @@ else
     echo "GoogleTest already installed, skipping."
 fi
 
-# RapidCheck from source (latest main branch).
+# RapidCheck from source (nix-on-z fork with -fPIC fix).
 # Ubuntu 22.04's RapidCheck has macro issues with C++23
 # (RC_GTEST_TYPED_FIXTURE_PROP fails to compile).
+# The fork adds CMAKE_POSITION_INDEPENDENT_CODE so the static library can be
+# linked into Nix's shared test-support libraries without text relocations,
+# which cause SIGSEGV on s390x.
 RC_DIR="${HOME}/rapidcheck-build"
 
 if [[ ! -f "${PREFIX}/lib/pkgconfig/rapidcheck.pc" ]] || \
    ! grep -q "${PREFIX}" "${PREFIX}/lib/pkgconfig/rapidcheck.pc" 2>/dev/null; then
-    echo "Building RapidCheck from source..."
+    echo "Building RapidCheck from source (nix-on-z fork)..."
     mkdir -p "$RC_DIR"
     cd "$RC_DIR"
     if [[ ! -d "rapidcheck" ]]; then
-        git clone --depth 1 https://github.com/emil-e/rapidcheck.git
+        git clone --depth 1 --branch nix-on-z https://github.com/randomizedcoder/rapidcheck.git
     fi
     cd rapidcheck
     rm -rf build && mkdir build && cd build
@@ -50,7 +53,8 @@ if [[ ! -f "${PREFIX}/lib/pkgconfig/rapidcheck.pc" ]] || \
         -DCMAKE_INSTALL_PREFIX="$PREFIX" \
         -DCMAKE_BUILD_TYPE=Release \
         -DRC_ENABLE_GTEST=ON \
-        -DRC_ENABLE_GMOCK=ON
+        -DRC_ENABLE_GMOCK=ON \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON
     make -j "$JOBS"
     sudo make install
     echo "RapidCheck installed."

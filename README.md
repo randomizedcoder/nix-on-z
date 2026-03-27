@@ -201,14 +201,15 @@ After applying both patches, building with `-Dunit-tests=true`, and installing
 |-------|--------|-------|
 | nix-fetchers-tests | **PASS** | All tests pass |
 | nix-flake-tests | **PASS** | All tests pass |
-| nix-util-tests | **PARTIAL** | 32/32 non-RapidCheck tests pass; RapidCheck property tests SIGSEGV |
-| nix-store-tests | **PARTIAL** | Non-RapidCheck tests pass; RapidCheck property tests SIGSEGV |
-| nix-expr-tests | **PARTIAL** | Non-RapidCheck tests pass; RapidCheck property tests SIGSEGV |
+| nix-util-tests | **PASS** | All tests pass (including RapidCheck property tests) |
+| nix-store-tests | **PASS** | All tests pass (including RapidCheck property tests) |
+| nix-expr-tests | **PASS** | All tests pass (including RapidCheck property tests) |
 
-**RapidCheck on s390x**: The RapidCheck property-based testing framework crashes
-(SIGSEGV) on s390x. This appears to be a platform-level issue — even a
-source-built latest RapidCheck exhibits the same crash. All non-RapidCheck
-unit tests pass cleanly.
+**RapidCheck on s390x**: Upstream RapidCheck's static library is not built with
+`-fPIC`. When linked into Nix's shared test-support libraries, text relocations
+cause SIGSEGV on s390x. The fix is `CMAKE_POSITION_INDEPENDENT_CODE=ON` in
+RapidCheck's build (applied in our [fork](https://github.com/randomizedcoder/rapidcheck/tree/nix-on-z)
+and in `15-test-deps.sh`).
 
 ### Functional Tests
 
