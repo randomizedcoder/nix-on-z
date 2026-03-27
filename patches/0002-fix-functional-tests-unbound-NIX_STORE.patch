@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: das <das@users.noreply.github.com>
+Date: Thu, 27 Mar 2026 00:00:00 +0000
+Subject: [PATCH 2/2] Fix unbound NIX_STORE variable in functional test
+ infrastructure
+
+On non-NixOS systems, NIX_STORE is not set. With bash's `set -u`
+(nounset) mode, the bare `$NIX_STORE` reference on line 47 of
+tests/functional/common/vars.sh causes an "unbound variable" error,
+making ALL functional tests fail immediately.
+
+Fix: use `${NIX_STORE-}` to default to empty string when unset.
+
+This affects any non-NixOS test environment (e.g., Ubuntu on s390x).
+---
+ tests/functional/common/vars.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tests/functional/common/vars.sh b/tests/functional/common/vars.sh
+index a6b83ae4e..07247cf24 100644
+--- a/tests/functional/common/vars.sh
++++ b/tests/functional/common/vars.sh
+@@ -44,7 +44,7 @@ if ! isTestOnNixOS; then
+   export NIX_DAEMON_SOCKET_PATH=$TEST_ROOT/dSocket
+   unset NIX_USER_CONF_FILES
+   export _NIX_TEST_SHARED=$TEST_ROOT/shared
+-  if [[ -n $NIX_STORE ]]; then
++  if [[ -n ${NIX_STORE-} ]]; then
+       export _NIX_TEST_NO_SANDBOX=1
+   fi
+   export _NIX_IN_TEST=$TEST_ROOT/shared
+--
+2.43.0

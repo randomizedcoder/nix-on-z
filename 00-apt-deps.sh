@@ -44,6 +44,9 @@ apt-get install -y \
     git \
     m4 \
     gettext \
-    lowdown
+    lowdown \
+    jq \
+    socat \
+    mercurial
 
 echo "Phase 0 complete: apt dependencies installed."
