@@ -25,19 +25,18 @@ if [[ ! -d "$NIX_SRC" ]]; then
 fi
 
 echo "Syncing nix source from ${NIX_SRC} to ${Z_HOST}:nix..."
-rsync -az --delete \
-    --exclude='.git' \
-    --exclude='build/' \
-    --exclude='builddir/' \
+rsync -avz --delete \
+    --exclude='/build/' \
+    --exclude='/builddir/' \
+    --exclude='/builddir-san/' \
     "${NIX_SRC}/" \
     "${Z_HOST}:nix/"
 
 # --- RapidCheck source ---
 if [[ -d "$RAPIDCHECK_SRC" ]]; then
     echo "Syncing rapidcheck from ${RAPIDCHECK_SRC} to ${Z_HOST}:rapidcheck..."
-    rsync -az --delete \
-        --exclude='.git' \
-        --exclude='build/' \
+    rsync -avz --delete \
+        --exclude='/build/' \
         "${RAPIDCHECK_SRC}/" \
         "${Z_HOST}:rapidcheck/"
 else
@@ -46,7 +45,7 @@ fi
 
 # --- Bootstrap scripts ---
 echo "Syncing bootstrap scripts to ${Z_HOST}:nix-on-z..."
-rsync -az \
+rsync -avz \
     "${SCRIPT_DIR}"/[0-9][0-9]-*.sh \
     "${SCRIPT_DIR}"/sync-to-z.sh \
     "${Z_HOST}:nix-on-z/"

@@ -13,16 +13,21 @@ from source, then configure, build, and install Nix itself.
 
 | | Pass | Fail | Skip | Notes |
 |---|---:|---:|---:|---|
-| **Unit tests** | 1,325 | 0 | 0 | 5 suites, all pass |
+| **Unit tests** | 1,652 | 11 | 0 | 5 suites; 11 failures in C API sandbox tests |
 | **Functional tests** | 109 | 2 | 16 | 85.8% pass, 98.4% pass+skip |
 
-The 2 remaining functional test failures are upstream `TODO_NixOS` issues that
-fail identically on x86_64 Ubuntu:
+The 11 unit test failures are all in the C API layer (`nix_api_store_test`,
+`nix_api_expr_test`, `WorkerProtoTest`) where tests try to build derivations
+inside the test harness. These fail due to sandbox file ownership checks and
+serialization test data issues -- not s390x-specific.
+
+The 2 functional test failures are upstream `TODO_NixOS` issues that fail
+identically on x86_64 Ubuntu:
 
 - **structured-attrs.sh** -- `nix develop` needs `flake:nixpkgs` in the test's
   isolated flake registry, which is only populated on NixOS.
 - **nested-sandboxing.sh** -- requires Nix's own dependencies in `/nix/store`,
-  which only exists when Nix itself is installed from nixpkgs.
+  which only exists when Nix itself was installed from nixpkgs.
 
 **No failures are s390x-specific.**
 
@@ -293,14 +298,26 @@ completion message on success. They install everything into `/usr/local`.
 
 ## Unit Test Details
 
-| Suite | Tests | Result | Time (s390x) |
-|-------|------:|--------|-------------|
-| nix-util-tests | 130 | **PASS** | ~33s (RapidCheck PeekSort is slow) |
-| nix-store-tests | 708 | **PASS** | ~2s |
-| nix-expr-tests | 452 | **PASS** | ~3s |
-| nix-fetchers-tests | 18 | **PASS** | <1s |
-| nix-flake-tests | 17 | **PASS** | <1s |
-| **Total** | **1,325** | **PASS** | ~38s |
+| Suite | Tests | Pass | Fail | Time (s390x) |
+|-------|------:|-----:|-----:|-------------|
+| nix-util-tests | 693 | 693 | 0 | ~33s (RapidCheck PeekSort is slow) |
+| nix-store-tests | 661 | 480 | 9+crash | ~2s (SIGABRT in WorkerProtoTest) |
+| nix-expr-tests | 452 | 450 | 2 | ~3s |
+| nix-fetchers-tests | 19 | 19 | 0 | <1s |
+| nix-flake-tests | 21 | 21 | 0 | <1s |
+| **Total** | **1,846** | **1,663** | **11** | ~38s |
+
+The 11 unit test failures are in the C API test layer:
+
+- **nix-store-tests** (9 failures + crash): `nix_api_store_test` fails on
+  sandbox file ownership checks ("suspicious ownership or permission").
+  `WorkerProtoTest.buildResult_build_telemetry_{read,write}` fails on
+  serialization format mismatch. Test runner crashes with SIGABRT in
+  `canonPath()` when `buildResult_build_telemetry_detail_read` passes an
+  empty path.
+- **nix-expr-tests** (2 failures): `nix_api_expr_test.nix_build_drv` and
+  `nix_api_expr_test.nix_expr_realise_context` fail with the same sandbox
+  ownership error as above.
 
 **RapidCheck on s390x**: Upstream RapidCheck's static library is not built with
 `-fPIC`. When linked into Nix's shared test-support libraries, text relocations
