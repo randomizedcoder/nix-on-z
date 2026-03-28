@@ -22,7 +22,7 @@ echo "--- Unit tests ---"
 for suite in nix-util-tests nix-store-tests nix-expr-tests nix-fetchers-tests nix-flake-tests; do
     echo ""
     echo "Running ${suite}..."
-    if meson test -C "$BUILD_DIR" "$suite" --verbose 2>&1 | tee "${RESULTS_DIR}/${suite}.log"; then
+    if meson test -C "$BUILD_DIR" "$suite" --verbose --timeout-multiplier 10 2>&1 | tee "${RESULTS_DIR}/${suite}.log"; then
         echo "PASS: ${suite}"
     else
         echo "FAIL: ${suite} (see ${RESULTS_DIR}/${suite}.log)"

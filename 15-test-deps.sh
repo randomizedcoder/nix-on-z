@@ -57,6 +57,13 @@ if [[ ! -f "${PREFIX}/lib/pkgconfig/rapidcheck.pc" ]] || \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON
     make -j "$JOBS"
     sudo make install
+    # RapidCheck's cmake install produces a .pc file with an empty Libs: line,
+    # so meson falls back to finding the system librapidcheck.a at
+    # /usr/lib/s390x-linux-gnu/. Replace it with our PIC-built version.
+    if [[ -f /usr/lib/s390x-linux-gnu/librapidcheck.a ]]; then
+        sudo cp "${PREFIX}/lib/librapidcheck.a" /usr/lib/s390x-linux-gnu/librapidcheck.a
+        echo "Replaced system librapidcheck.a with PIC version."
+    fi
     echo "RapidCheck installed."
 else
     echo "RapidCheck already installed, skipping."
