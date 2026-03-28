@@ -2,11 +2,39 @@
 set -euo pipefail
 
 # Install test dependencies for running Nix's unit and functional tests.
-# Both GoogleTest and RapidCheck must be built from source because
-# Ubuntu 22.04's versions are incompatible with GCC 14 / C++23.
+#
+# jq is built from source because Nix's functional tests assume modern
+# tooling (jq >= 1.7 for .[]? try-iterate syntax). Ubuntu 22.04 ships 1.6.
+#
+# GoogleTest and RapidCheck must be built from source because Ubuntu 22.04's
+# versions are incompatible with GCC 14 / C++23.
 
 PREFIX="/usr/local"
 JOBS="$(nproc)"
+
+# jq 1.7.1 from source.
+# Nix's functional tests use jq 1.7+ syntax (e.g., `.info.[].ca`).
+# Ubuntu 22.04 ships jq 1.6 which does not support this.
+JQ_VERSION="1.7.1"
+JQ_DIR="${HOME}/jq-build"
+
+if ! jq --version 2>/dev/null | grep -q "jq-1\.[7-9]"; then
+    echo "Building jq ${JQ_VERSION}..."
+    mkdir -p "$JQ_DIR"
+    cd "$JQ_DIR"
+    if [[ ! -d "jq" ]]; then
+        git clone --depth 1 --branch "jq-${JQ_VERSION}" https://github.com/jqlang/jq.git
+    fi
+    cd jq
+    git submodule update --init
+    autoreconf -i
+    ./configure --with-oniguruma=builtin --prefix="$PREFIX"
+    make -j "$JOBS"
+    sudo make install
+    echo "jq ${JQ_VERSION} installed."
+else
+    echo "jq >= 1.7 already installed, skipping."
+fi
 
 # GoogleTest 1.15.2 from source.
 # Ubuntu 22.04's GoogleTest 1.11 triggers -Werror=undef with GCC 14

@@ -16,6 +16,11 @@ fi
 
 apt-get update
 
+# Remove busybox-static if present — Ubuntu's busybox doesn't work
+# in the Nix store (argv[0] applet lookup fails), and its presence
+# causes meson to set sandbox_shell, making tests fail instead of skip.
+apt-get remove -y busybox-static 2>/dev/null || true
+
 apt-get install -y \
     ninja-build \
     pkg-config \
@@ -45,8 +50,6 @@ apt-get install -y \
     m4 \
     gettext \
     lowdown \
-    jq \
-    socat \
-    mercurial
+    bash-static
 
 echo "Phase 0 complete: apt dependencies installed."

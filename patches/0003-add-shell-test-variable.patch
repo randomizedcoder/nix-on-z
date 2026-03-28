@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: das <das@users.noreply.github.com>
+Date: Fri, 28 Mar 2026 00:00:00 +0000
+Subject: [PATCH 3/4] Add $shell test variable for non-NixOS systems
+
+Several functional tests (formatter.sh, nix-profile.sh) use ${shell}
+in heredocs to create derivation build scripts. This variable was
+never defined in the test infrastructure for non-NixOS systems,
+causing "unbound variable" failures under bash's `set -u` mode.
+
+Fix: add `shell=@bash@` to the meson-substituted subst-vars.sh.in
+template, and add $shell to the validation and export lines in vars.sh.
+
+This affects any non-NixOS test environment (e.g., Ubuntu on any arch).
+---
+ tests/functional/common/subst-vars.sh.in | 1 +
+ tests/functional/common/vars.sh          | 4 ++--
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/tests/functional/common/subst-vars.sh.in b/tests/functional/common/subst-vars.sh.in
+index df140dec1..5c836110b 100644
+--- a/tests/functional/common/subst-vars.sh.in
++++ b/tests/functional/common/subst-vars.sh.in
+@@ -5,6 +5,7 @@ if [[ -z "${COMMON_SUBST_VARS_SH_SOURCED-}" ]]; then
+ COMMON_SUBST_VARS_SH_SOURCED=1
+
+ bash=@bash@
++shell=@bash@
+ bindir=@bindir@
+ coreutils=@coreutils@
+
+diff --git a/tests/functional/common/vars.sh b/tests/functional/common/vars.sh
+index 07247cf24..a68bf4457 100644
+--- a/tests/functional/common/vars.sh
++++ b/tests/functional/common/vars.sh
+@@ -15,8 +15,8 @@ commonDir="$(readlink -f "$(dirname "${BASH_SOURCE[0]-$0}")")"
+ # shellcheck disable=SC1091
+ source "${_NIX_TEST_BUILD_DIR}/common/subst-vars.sh"
+ # Make sure shellcheck knows all these will be defined by the above generated snippet
+-: "${bindir?} ${coreutils?} ${dot?} ${SHELL?} ${busybox?} ${version?} ${system?}"
+-export coreutils dot busybox version system
++: "${bindir?} ${coreutils?} ${dot?} ${shell?} ${SHELL?} ${busybox?} ${version?} ${system?}"
++export coreutils dot shell busybox version system
+
+ export PAGER=cat
+
+--
+2.43.0
+

@@ -20,7 +20,8 @@ if [[ -d "$BUILD_DIR" ]]; then
         -Dbindings=false \
         -Dbenchmarks=false \
         -Djson-schema-checks=false \
-        -Dlibcmd:readline-flavor=readline
+        -Dlibcmd:readline-flavor=readline \
+        -Dlibstore:sandbox-shell=/usr/bin/bash-static
 else
     meson setup "$BUILD_DIR" \
         --prefix=/usr/local \
@@ -29,7 +30,8 @@ else
         -Dbindings=false \
         -Dbenchmarks=false \
         -Djson-schema-checks=false \
-        -Dlibcmd:readline-flavor=readline
+        -Dlibcmd:readline-flavor=readline \
+        -Dlibstore:sandbox-shell=/usr/bin/bash-static
 fi
 
 echo "Building Nix (with tests) using ${JOBS} jobs..."

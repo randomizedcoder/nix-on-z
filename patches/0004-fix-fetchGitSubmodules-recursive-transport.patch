@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: das <das@users.noreply.github.com>
+Date: Fri, 28 Mar 2026 00:00:00 +0000
+Subject: [PATCH 4/4] Fix recursive git submodule transport in
+ fetchGitSubmodules test
+
+The nested submodule test in fetchGitSubmodules.sh fails because
+GIT_CONFIG_COUNT environment variables do not propagate through
+recursive `git submodule update` helper processes on older git
+versions (e.g., git 2.34.1 shipped with Ubuntu 22.04).
+
+Fix: use `git -c protocol.file.allow=always` instead of relying on
+GIT_CONFIG_COUNT environment variables. The `-c` flag sets
+GIT_CONFIG_PARAMETERS which does propagate to recursive subprocesses.
+
+This affects any system with git < 2.39 where protocol.file.allow
+defaults to "user" (CVE-2022-39253 backport).
+---
+ tests/functional/fetchGitSubmodules.sh | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tests/functional/fetchGitSubmodules.sh b/tests/functional/fetchGitSubmodules.sh
+index 7839fef0d..b1cc4c11d 100755
+--- a/tests/functional/fetchGitSubmodules.sh
++++ b/tests/functional/fetchGitSubmodules.sh
+@@ -225,7 +225,9 @@ test_submodule_nested() {
+
+   # Check worktree based fetch
+   # TODO: make it work without git submodule update
+-  git -C "$repoA" submodule update --init --recursive
++  # Use -c flag for protocol.file.allow because GIT_CONFIG_COUNT env vars
++  # do not propagate to recursive submodule helper processes on older git.
++  git -c protocol.file.allow=always -C "$repoA" submodule update --init --recursive
+   out=$(nix eval --impure --raw --expr "(builtins.fetchGit { url = \"file://$repoA\"; submodules = true; }).outPath")
+   find "$out"
+   [[ $out == "$nonWorktree" ]] || { find "$out"; false; }
+--
+2.43.0
+
