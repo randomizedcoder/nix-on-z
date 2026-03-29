@@ -1,0 +1,118 @@
+diff --git a/src/nix/develop.cc b/src/nix/develop.cc
+index 29b44d780..d231c80ca 100644
+--- a/src/nix/develop.cc
++++ b/src/nix/develop.cc
+@@ -390,7 +390,17 @@ struct Common : InstallableCommand, MixProfile
+         StringMap rewrites;
+         if (buildEnvironment.providesStructuredAttrs()) {
+             for (auto & [outputName, from] : BuildEnvironment::getAssociative(outputs->second)) {
+-                rewrites.insert({from, (outputsDir / outputName).string()});
++                auto to = (outputsDir / outputName).string();
++                rewrites.insert({from, to});
++                /* With structured attrs, outputs are stored in an
++                   associative array (declare -A outputs=(...)) but
++                   individual output variables like $out and $dev are
++                   not emitted by toBash().  Nix's stdenv setup.sh
++                   extracts these from the array at build time, but
++                   nix develop skips stdenv and sources the environment
++                   directly.  Emit them here so that `nix develop -c
++                   bash -c 'test -n "$out"'` works as expected. */
++                script += fmt("export %s=%s\n", outputName, escapeShellArgAlways(to));
+             }
+         } else {
+             for (auto & outputName : BuildEnvironment::getStrings(outputs->second)) {
+@@ -638,42 +648,61 @@ struct CmdDevelop : Common, MixEnvironment
+         std::filesystem::path shell = "bash";
+         bool foundInteractive = false;
+ 
+-        try {
+-            auto state = getEvalState();
+-
+-            auto nixpkgsLockFlags = lockFlags;
+-            nixpkgsLockFlags.inputOverrides = {};
+-            nixpkgsLockFlags.inputUpdates = {};
+-
+-            auto nixpkgs = defaultNixpkgsFlakeRef();
+-            if (auto * i = dynamic_cast<const InstallableFlake *>(&*installable))
+-                nixpkgs = i->nixpkgsFlakeRef();
+-
+-            auto bashInstallable = make_ref<InstallableFlake>(
+-                nullptr, //< Don't barf when the command is run with --arg/--argstr
+-                state,
+-                std::move(nixpkgs),
+-                "bashInteractive",
+-                ExtendedOutputsSpec::Default(),
+-                Strings{},
+-                Strings{"legacyPackages." + settings.thisSystem.get() + "."},
+-                nixpkgsLockFlags);
+-
+-            for (auto & path : Installable::toStorePathSet(
+-                     getEvalStore(), store, Realise::Outputs, OperateOn::Output, {bashInstallable})) {
+-                auto s = store->printStorePath(path) + "/bin/bash";
+-                if (pathExists(s)) {
+-                    shell = s;
+-                    foundInteractive = true;
+-                    break;
++        /* Try to find bashInteractive from nixpkgs for a better shell
++           experience.  However, only attempt this when the installable
++           is a flake — in that case we can extract the nixpkgs input
++           from the flake's lock file.
++
++           When the user passes -f/--file (non-flake mode), the
++           installable is an InstallableAttrPath and we have no flake
++           lock file to get nixpkgs from.  Falling back to
++           defaultNixpkgsFlakeRef() ("flake:nixpkgs") would attempt a
++           flake registry lookup, which (a) fails when tests use an
++           isolated empty registry and (b) is conceptually wrong since
++           the user explicitly chose file mode.  The silent catch at
++           the end masks this failure but leaves the build environment
++           in a broken state where structured attrs variables ($out,
++           $outputs) are empty.
++
++           By skipping the lookup entirely for non-flake installables
++           we avoid the spurious registry access and fall back cleanly
++           to the system "bash". */
++        if (auto * flakeInstallable = dynamic_cast<const InstallableFlake *>(&*installable)) {
++            try {
++                auto state = getEvalState();
++
++                auto nixpkgsLockFlags = lockFlags;
++                nixpkgsLockFlags.inputOverrides = {};
++                nixpkgsLockFlags.inputUpdates = {};
++
++                auto nixpkgs = flakeInstallable->nixpkgsFlakeRef();
++
++                auto bashInstallable = make_ref<InstallableFlake>(
++                    nullptr, //< Don't barf when the command is run with --arg/--argstr
++                    state,
++                    std::move(nixpkgs),
++                    "bashInteractive",
++                    ExtendedOutputsSpec::Default(),
++                    Strings{},
++                    Strings{"legacyPackages." + settings.thisSystem.get() + "."},
++                    nixpkgsLockFlags);
++
++                for (auto & path : Installable::toStorePathSet(
++                         getEvalStore(), store, Realise::Outputs, OperateOn::Output, {bashInstallable})) {
++                    auto s = store->printStorePath(path) + "/bin/bash";
++                    if (pathExists(s)) {
++                        shell = s;
++                        foundInteractive = true;
++                        break;
++                    }
+                 }
+-            }
+ 
+-            if (!foundInteractive)
+-                throw Error("package 'nixpkgs#bashInteractive' does not provide a 'bin/bash'");
++                if (!foundInteractive)
++                    throw Error("package 'nixpkgs#bashInteractive' does not provide a 'bin/bash'");
+ 
+-        } catch (Error &) {
+-            ignoreExceptionExceptInterrupt();
++            } catch (Error &) {
++                ignoreExceptionExceptInterrupt();
++            }
+         }
+ 
+         // Override SHELL with the one chosen for this environment.

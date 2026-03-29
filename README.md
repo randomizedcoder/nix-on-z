@@ -14,18 +14,18 @@ from source, then configure, build, and install Nix itself.
 | | Pass | Fail | Skip | Notes |
 |---|---:|---:|---:|---|
 | **Unit tests** | 1,846 | 0 | 0 | 5 suites, all pass |
-| **Functional tests** | 109 | 2 | 16 | 85.8% pass, 98.4% pass+skip |
+| **Functional tests** | 183 | 0 | 30 | 100% pass rate (skips are expected) |
 
-The 2 functional test failures are upstream bugs that affect all non-NixOS
-systems (including x86_64 Ubuntu). Neither is s390x-specific. Both are
-candidates for upstream patches — see [Remaining Functional Test
-Failures](#remaining-functional-test-failures) for root cause analysis.
+**All tests pass. No failures. No s390x-specific issues.**
 
-**No failures are s390x-specific.**
+The 30 skipped tests are expected: `busybox`-specific tests (we use
+`bash-static`), macOS-only tests, tests requiring a populated `/nix/store`
+(we bootstrap from source), and tests requiring infrastructure not present
+in a bare-metal build.
 
 ## Nix Source Patches
 
-Five patches are required. Two add s390x architecture support. Three fix test
+Seven patches are required. Two add s390x architecture support. Five fix test
 infrastructure bugs that affect all platforms (not s390x-specific). Patches
 are applied to a clean checkout of [NixOS/nix](https://github.com/NixOS/nix)
 master.
@@ -37,6 +37,8 @@ master.
 | 0003 | `subst-vars.sh.in`, `vars.sh` | all platforms | Add missing `$shell` test variable |
 | 0004 | `fetchGitSubmodules.sh` | all platforms | Fix recursive git submodule transport |
 | 0005 | `derivation-builder.cc` | all platforms | Fix sandbox ownership check for non-root builds |
+| 0006 | `develop.cc` | all platforms | Fix `nix develop -f` structured attrs + flake registry |
+| 0007 | `nested-sandboxing.sh` | all platforms | Fix skip check for empty `/nix/store` |
 
 ### Patch 1: s390x architecture support
 
@@ -105,6 +107,72 @@ non-null, matching the existing UID ownership check which is already gated.
 This fixes 9 C API test failures (`nix_api_store_test`, `nix_api_expr_test`)
 that build derivations inside the test harness.
 
+### Patch 6: Fix `nix develop -f` structured attrs and flake registry lookup
+
+`nix develop` always tries to find `bashInteractive` from nixpkgs to provide
+a better interactive shell, even when the user passes `-f` (file mode, not
+flake mode). Two bugs interact here:
+
+**Bug 1 — Spurious flake registry lookup**: In `src/nix/develop.cc` (line 648),
+the code calls `defaultNixpkgsFlakeRef()` which returns `flake:nixpkgs` — an
+indirect flake reference requiring a flake registry. When the installable is
+created via `-f`, it's an `InstallableAttrPath`, not an `InstallableFlake`.
+The `dynamic_cast` at line 649 fails, so it falls back to the default
+`flake:nixpkgs` lookup. This always fails in the test harness because tests
+use an isolated empty flake registry (`flake-registry = $TEST_ROOT/registry.json`
+in `common/init.sh`). The error is silently caught (lines 675-677) but leaves
+the shell environment in a broken state.
+
+**Bug 2 — Missing individual output variables for structured attrs**: With
+structured attrs (`__structuredAttrs = true`), output paths are stored in a
+bash associative array (`declare -A outputs=([out]='...' [dev]='...')`).
+The `toBash()` method in `develop.cc` emits this array, but does NOT emit
+individual variables like `$out` and `$dev`. Normally, Nix's `stdenv/setup.sh`
+extracts these from the array at build time, but `nix develop` skips stdenv
+and sources the environment directly. The test at `structured-attrs.sh:31`
+(`test -n "$out"`) fails because `$out` is never set.
+
+Fix (two parts):
+1. Skip the bashInteractive lookup entirely when the installable is not a
+   flake (`InstallableFlake`). For non-flake mode, fall back directly to
+   system bash without attempting flake registry resolution.
+2. When emitting structured attrs outputs, also export individual variables
+   (`out`, `dev`, etc.) from the associative array, matching what `stdenv`
+   would do at build time.
+
+### Patch 7: Fix nested-sandboxing skip check for empty `/nix/store`
+
+The `nested-sandboxing.sh` test runs recursive nix-builds at multiple nesting
+levels, each inside its own sandbox. This requires a populated `/nix/store`
+with Nix's runtime dependencies (bash, coreutils) because `config.nix`
+references these paths as the builder shell and PATH.
+
+The skip check at line 5 only tests for directory existence:
+```bash
+[[ -d /nix/store ]] || skipTest "..."
+```
+
+On a bootstrap installation (like nix-on-z), `/nix/store` exists but is empty.
+The test proceeds and then fails because:
+- `config.nix` sets `shell = "/usr/bin/bash"` (the system bash)
+- Inside the sandbox chroot, only `/bin/sh` (the sandbox shell) exists
+- The builder tries to execute `/usr/bin/bash` which doesn't exist in the chroot
+- This causes `error: executing '/usr/bin/bash': No such file or directory`
+- The error message doesn't match the expected `` `sandbox-build-dir` must not
+  contain `` pattern, so the `grepQuiet` at line 24 fails
+
+Fix: replace the directory-existence check with a content check that verifies
+`/nix/store` is actually populated:
+```bash
+if [[ ! -d /nix/store ]] || [[ -z "$(ls -A /nix/store 2>/dev/null)" ]]; then
+    skipTest "nested sandboxing requires a populated /nix/store with Nix's runtime dependencies"
+fi
+```
+
+This follows the existing pattern of prerequisite checks (`requireSandboxSupport`,
+`requireGit`, etc.) and correctly skips on bootstrap installations while still
+running on NixOS where `/nix/store` is fully populated.
+
 ## How to Reproduce
 
 ### Prerequisites
@@ -137,11 +205,19 @@ git clone -b nix-on-z https://github.com/randomizedcoder/rapidcheck.git
 
 ```bash
 cd ~/Downloads/nix
+git apply ../nix-on-z/patches/*.patch
+```
+
+Or apply individually:
+
+```bash
 git apply ../nix-on-z/patches/0001-add-s390x-support.patch
 git apply ../nix-on-z/patches/0002-fix-functional-tests-unbound-NIX_STORE.patch
 git apply ../nix-on-z/patches/0003-add-shell-test-variable.patch
 git apply ../nix-on-z/patches/0004-fix-fetchGitSubmodules-recursive-transport.patch
 git apply ../nix-on-z/patches/0005-fix-sandbox-ownership-check-non-root.patch
+git apply ../nix-on-z/patches/0006-fix-nix-develop-structured-attrs-outputs.patch
+git apply ../nix-on-z/patches/0007-fix-nested-sandboxing-skip-check.patch
 ```
 
 Verify patches applied correctly:
@@ -151,7 +227,9 @@ grep '__s390x__' src/libmain/unix/stack.cc                        # Patch 1
 grep 'NIX_STORE-' tests/functional/common/vars.sh                 # Patch 2
 grep '^shell=' tests/functional/common/subst-vars.sh.in           # Patch 3
 grep 'protocol.file.allow=always' tests/functional/fetchGitSubmodules.sh  # Patch 4
-grep 'buildUser' src/libstore/unix/build/derivation-builder.cc | grep -c 'if (buildUser'  # Patch 5 (should show 1)
+grep 'buildUser' src/libstore/unix/build/derivation-builder.cc | grep -c 'if (buildUser'  # Patch 5
+grep 'flakeInstallable' src/nix/develop.cc                        # Patch 6
+grep 'ls -A /nix/store' tests/functional/nested-sandboxing.sh     # Patch 7
 ```
 
 ### Step 3: Configure SSH
@@ -230,7 +308,7 @@ cd ~/nix
 bash ~/nix-on-z/17-run-tests.sh
 ```
 
-Expected results: 1,846 unit tests pass, 109/2/16 functional pass/fail/skip.
+Expected results: 1,846 unit tests pass, 183/0/30 functional pass/fail/skip.
 
 ### Step 7: Verify
 
@@ -321,6 +399,44 @@ meson setup build --reconfigure \
 This gives full sandboxed build support while keeping the busybox-dependent
 functional tests in their expected skip state.
 
+### The `config.nix` bash/sh problem
+
+When meson configures the test suite, it generates
+`build/src/nix-functional-tests/config.nix` from a template. This file contains:
+
+```nix
+shell = "/usr/bin/bash";
+path  = "/usr/bin";
+```
+
+These values come from the **host** system — they are the real paths to bash and
+the standard PATH on the machine that built Nix. Functional tests source
+`config.nix` to find the builder shell and tool PATH.
+
+This works fine for tests that run directly on the host. But when a test runs a
+build **inside a sandbox chroot**, the chroot filesystem is nearly empty. The
+only shell available is `/bin/sh`, which Nix creates as a symlink to the sandbox
+shell (e.g., `/usr/bin/bash-static`). The host path `/usr/bin/bash` does not
+exist inside the chroot.
+
+This creates a class of failures where:
+1. A test invokes `nix-build` which enters the sandbox
+2. The builder tries to execute `/usr/bin/bash` (from `config.nix`)
+3. The sandbox has no `/usr/bin/bash` — only `/bin/sh`
+4. The build fails with: `error: executing '/usr/bin/bash': No such file or directory`
+
+On NixOS, this problem does not occur because `config.nix` points to a
+`/nix/store/.../bash` path, and Nix mounts `/nix/store` inside the sandbox via
+`--extra-sandbox-paths`. On non-NixOS systems building from source (like this
+project), the host shell path is used instead and breaks inside the chroot.
+
+Tests affected by this include `nested-sandboxing.sh` (see Patch 7) and
+potentially any test that does nested `nix-build` calls inside a sandbox. The
+practical impact is limited because most affected tests also require a populated
+`/nix/store` and are correctly skipped for other reasons. This is a known
+limitation of running Nix's test suite outside of NixOS and is not
+s390x-specific.
+
 ## Scripts
 
 Each script is self-contained, idempotent (safe to re-run), and prints a
@@ -380,84 +496,15 @@ RapidCheck property-based sort tests are slow on s390x's 2 shared IFLs.
 
 ## Functional Test Details
 
-109 pass / 2 fail / 16 skip out of 127 tests in the main suite.
+183 pass / 0 fail / 30 skip out of 213 tests across all suites.
 
-The 16 skips are expected: tests for `busybox`, `macOS`, `help` rendering, and
-features requiring infrastructure not present in a bare-metal bootstrap.
+The 30 skips are expected: `busybox`-specific tests (we use `bash-static`),
+macOS-only tests, tests requiring a populated `/nix/store` (we bootstrap from
+source), and tests requiring infrastructure not present in a bare-metal build.
 
-### Remaining Functional Test Failures
-
-Both failures are upstream bugs that affect all non-NixOS systems. Neither is
-s390x-specific. Root cause analysis and proposed fixes follow.
-
-#### structured-attrs.sh — `nix develop -f` tries to resolve `flake:nixpkgs`
-
-**Error**: `error (ignored): cannot find flake 'flake:nixpkgs' in the flake registries`
-
-**Root cause**: `nix develop` always tries to find `bashInteractive` from
-nixpkgs, even in non-flake file mode (`-f`). In `src/nix/develop.cc` lines
-648-660, the code calls `defaultNixpkgsFlakeRef()` which returns
-`flake:nixpkgs` — an indirect flake reference that requires a flake registry.
-
-When the installable is created via `-f` (file mode), it's an
-`InstallableAttrPath`, not an `InstallableFlake`. The code at line 649 tries
-to `dynamic_cast` to `InstallableFlake` to extract the nixpkgs reference, but
-this fails, so it falls back to the default `flake:nixpkgs` lookup. The
-registry resolution error is silently caught (lines 675-677), but this causes
-the structured attrs environment variables (`$out`, `$outputs`) to be empty.
-
-Lines 23 and 31 of the test run the same `nix develop -f` command. Line 23
-checks `$NIX_ATTRS_JSON_FILE` (which works). Line 31 checks `$out` (which is
-empty due to the broken bashInteractive resolution).
-
-**Proposed fix**: Skip the bashInteractive lookup entirely when the installable
-is not a flake. For non-flake mode, fall back directly to system bash without
-attempting flake registry resolution:
-
-```cpp
-// src/nix/develop.cc, around line 648
-if (auto * i = dynamic_cast<const InstallableFlake *>(&*installable)) {
-    // Only attempt bashInteractive lookup for flake installables
-    auto nixpkgs = i->nixpkgsFlakeRef();
-    // ... bashInteractive resolution
-}
-// For non-flake installables (-f mode), skip entirely and use system bash
-```
-
-#### nested-sandboxing.sh — skip check doesn't verify `/nix/store` content
-
-**Error**: Build fails at altitude 5 because hardcoded store paths don't exist.
-
-**Root cause**: The skip check at line 5 only verifies that `/nix/store`
-exists as a directory:
-
-```bash
-[[ -d /nix/store ]] || skipTest "running this test without Nix's deps ..."
-```
-
-On a bootstrap installation (like nix-on-z), `/nix/store` exists but is empty.
-The test then tries to run `runner.nix` which imports `config.nix` — a
-generated file containing hardcoded `/nix/store` paths for bash and coreutils
-(e.g., `/nix/store/fwr62xmh06l8y8zfgc5m18pfap9b8az0-bash-5.3p3/bin/bash`).
-These paths only exist when Nix itself was installed from nixpkgs.
-
-The test runs 5 levels of recursive nix-build, each building a derivation
-inside a sandbox that mounts `/nix/store` via `--extra-sandbox-paths`. With
-an empty store, the builder shell path doesn't exist and the build fails.
-
-**Proposed fix**: Check for actual content in `/nix/store`, not just directory
-existence:
-
-```bash
-# tests/functional/nested-sandboxing.sh, line 5
-[[ -d /nix/store ]] || skipTest "running this test without Nix's deps being drawn from /nix/store is not yet supported"
-# Skip if /nix/store is empty or missing required tools
-ls /nix/store/*/bin/bash &>/dev/null || skipTest "/nix/store does not contain bash; nested sandboxing requires a fully populated store"
-```
-
-This follows the existing pattern of other prerequisite checks
-(`requireSandboxSupport`, `requireGit`, etc.) and correctly skips the test on
-bootstrap installations while still running it on NixOS.
+With patches 6 and 7 applied, all functional tests either pass or correctly
+skip. Without these patches, `structured-attrs.sh` and `nested-sandboxing.sh`
+fail — see patch descriptions above for the root cause analysis.
 
 ## Endianness Analysis
 
