@@ -1,0 +1,25 @@
+diff --git a/src/libstore/unix/build/derivation-builder.cc b/src/libstore/unix/build/derivation-builder.cc
+index 6302e1758..83729bb24 100644
+--- a/src/libstore/unix/build/derivation-builder.cc
++++ b/src/libstore/unix/build/derivation-builder.cc
+@@ -1511,9 +1511,17 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs()
+         /* Check that the output is not group or world writable, as
+            that means that someone else can have interfered with the
+            build.  Also, the output should be owned by the build
+-           user. */
+-        if ((!S_ISLNK(st.st_mode) && (st.st_mode & (S_IWGRP | S_IWOTH)))
+-            || (buildUser && st.st_uid != buildUser->getUID()))
++           user.
++
++           When there is no build user (non-root builds), the entire
++           sandbox is owned by the current user and the
++           group/world-writable check is not meaningful — the builder
++           inherits the caller's umask, so files may legitimately have
++           group-writable bits (e.g. umask 0002).  The permission bits
++           are canonicalised immediately after this check anyway. */
++        if (buildUser
++            && ((!S_ISLNK(st.st_mode) && (st.st_mode & (S_IWGRP | S_IWOTH)))
++                || st.st_uid != buildUser->getUID()))
+             throw BuildError(
+                 BuildResult::Failure::OutputRejected,
+                 "suspicious ownership or permission on %s for output '%s'; rejecting this build output",
