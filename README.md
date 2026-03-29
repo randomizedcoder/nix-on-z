@@ -18,10 +18,47 @@ from source, then configure, build, and install Nix itself.
 
 **All tests pass. No failures. No s390x-specific issues.**
 
+### Unit tests: 1,932 pass / 0 fail (5 suites)
+
+| Suite | Tests | Pass | Fail | Time (s390x) |
+|-------|------:|-----:|-----:|-------------|
+| nix-util-tests | 732 | 732 | 0 | ~33s (RapidCheck PeekSort is slow) |
+| nix-store-tests | 708 | 708 | 0 | ~2s |
+| nix-expr-tests | 452 | 452 | 0 | ~3s |
+| nix-fetchers-tests | 19 | 19 | 0 | <1s |
+| nix-flake-tests | 21 | 21 | 0 | <1s |
+| **Total** | **1,932** | **1,932** | **0** | ~38s |
+
+All unit tests pass with patch 5 (sandbox ownership fix) applied. Without
+this patch, 9 C API tests fail due to the sandbox rejecting build outputs
+with group-writable permission bits.
+
+**RapidCheck on s390x**: Upstream RapidCheck's static library is not built with
+`-fPIC`. When linked into Nix's shared test-support libraries, text relocations
+cause SIGSEGV on s390x. The fix is `CMAKE_POSITION_INDEPENDENT_CODE=ON` in
+RapidCheck's build (applied in our [fork](https://github.com/randomizedcoder/rapidcheck/tree/nix-on-z)
+and in `15-test-deps.sh`).
+
+The `nix-util-tests` suite needs `-t 10` (10x timeout multiplier) because the
+RapidCheck property-based sort tests are slow on s390x's 2 shared IFLs.
+
+### Functional tests: 178 pass / 0 fail / 30 skip (208 total across 9 suites)
+
 The 30 skipped tests are expected: `busybox`-specific tests (we use
 `bash-static`), macOS-only tests, tests requiring a populated `/nix/store`
 (we bootstrap from source), and tests requiring infrastructure not present
 in a bare-metal build.
+
+With patches 6 and 7 applied, all functional tests either pass or correctly
+skip. Without these patches, `structured-attrs.sh` and `nested-sandboxing.sh`
+fail — see patch descriptions above for the root cause analysis.
+
+### Patch validation
+
+All patches verified on the actual s390x machine. Key validations:
+- **Patch 5** (sandbox ownership): 0 unit test failures (was 9 without it)
+- **Patch 6** (structured-attrs): `structured-attrs.sh` passes (was failing)
+- **Patch 7** (nested-sandboxing): correctly SKIPs (was failing)
 
 ## Nix Source Patches
 
@@ -469,42 +506,6 @@ completion message on success. They install everything into `/usr/local`.
 | Script | Purpose |
 |--------|---------|
 | `sync-to-z.sh` | rsync helper to push Nix source, RapidCheck source, and scripts to `z` |
-
-## Unit Test Details
-
-| Suite | Tests | Pass | Fail | Time (s390x) |
-|-------|------:|-----:|-----:|-------------|
-| nix-util-tests | 732 | 732 | 0 | ~33s (RapidCheck PeekSort is slow) |
-| nix-store-tests | 708 | 708 | 0 | ~2s |
-| nix-expr-tests | 452 | 452 | 0 | ~3s |
-| nix-fetchers-tests | 19 | 19 | 0 | <1s |
-| nix-flake-tests | 21 | 21 | 0 | <1s |
-| **Total** | **1,932** | **1,932** | **0** | ~38s |
-
-All unit tests pass with patch 5 (sandbox ownership fix) applied. Without
-this patch, 9 C API tests fail due to the sandbox rejecting build outputs
-with group-writable permission bits.
-
-**RapidCheck on s390x**: Upstream RapidCheck's static library is not built with
-`-fPIC`. When linked into Nix's shared test-support libraries, text relocations
-cause SIGSEGV on s390x. The fix is `CMAKE_POSITION_INDEPENDENT_CODE=ON` in
-RapidCheck's build (applied in our [fork](https://github.com/randomizedcoder/rapidcheck/tree/nix-on-z)
-and in `15-test-deps.sh`).
-
-The `nix-util-tests` suite needs `-t 10` (10x timeout multiplier) because the
-RapidCheck property-based sort tests are slow on s390x's 2 shared IFLs.
-
-## Functional Test Details
-
-178 pass / 0 fail / 30 skip out of 208 tests across all suites.
-
-The 30 skips are expected: `busybox`-specific tests (we use `bash-static`),
-macOS-only tests, tests requiring a populated `/nix/store` (we bootstrap from
-source), and tests requiring infrastructure not present in a bare-metal build.
-
-With patches 6 and 7 applied, all functional tests either pass or correctly
-skip. Without these patches, `structured-attrs.sh` and `nested-sandboxing.sh`
-fail — see patch descriptions above for the root cause analysis.
 
 ## Endianness Analysis
 
