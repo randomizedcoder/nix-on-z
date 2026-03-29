@@ -13,8 +13,8 @@ from source, then configure, build, and install Nix itself.
 
 | | Pass | Fail | Skip | Notes |
 |---|---:|---:|---:|---|
-| **Unit tests** | 1,846 | 0 | 0 | 5 suites, all pass |
-| **Functional tests** | 183 | 0 | 30 | 100% pass rate (skips are expected) |
+| **Unit tests** | 1,932 | 0 | 0 | 5 suites, all pass |
+| **Functional tests** | 178 | 0 | 30 | 100% pass rate (skips are expected) |
 
 **All tests pass. No failures. No s390x-specific issues.**
 
@@ -308,7 +308,7 @@ cd ~/nix
 bash ~/nix-on-z/17-run-tests.sh
 ```
 
-Expected results: 1,846 unit tests pass, 183/0/30 functional pass/fail/skip.
+Expected results: 1,932 unit tests pass, 178/0/30 functional pass/fail/skip.
 
 ### Step 7: Verify
 
@@ -474,12 +474,12 @@ completion message on success. They install everything into `/usr/local`.
 
 | Suite | Tests | Pass | Fail | Time (s390x) |
 |-------|------:|-----:|-----:|-------------|
-| nix-util-tests | 693 | 693 | 0 | ~33s (RapidCheck PeekSort is slow) |
-| nix-store-tests | 661 | 661 | 0 | ~2s |
+| nix-util-tests | 732 | 732 | 0 | ~33s (RapidCheck PeekSort is slow) |
+| nix-store-tests | 708 | 708 | 0 | ~2s |
 | nix-expr-tests | 452 | 452 | 0 | ~3s |
 | nix-fetchers-tests | 19 | 19 | 0 | <1s |
 | nix-flake-tests | 21 | 21 | 0 | <1s |
-| **Total** | **1,846** | **1,846** | **0** | ~38s |
+| **Total** | **1,932** | **1,932** | **0** | ~38s |
 
 All unit tests pass with patch 5 (sandbox ownership fix) applied. Without
 this patch, 9 C API tests fail due to the sandbox rejecting build outputs
@@ -496,7 +496,7 @@ RapidCheck property-based sort tests are slow on s390x's 2 shared IFLs.
 
 ## Functional Test Details
 
-183 pass / 0 fail / 30 skip out of 213 tests across all suites.
+178 pass / 0 fail / 30 skip out of 208 tests across all suites.
 
 The 30 skips are expected: `busybox`-specific tests (we use `bash-static`),
 macOS-only tests, tests requiring a populated `/nix/store` (we bootstrap from
