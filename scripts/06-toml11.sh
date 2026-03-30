@@ -10,6 +10,13 @@ TOML11_URL="https://github.com/ToruNiina/toml11.git"
 BUILD_DIR="${HOME}/toml11-build"
 PREFIX="/usr/local"
 
+# Skip if correct version is already installed
+if [[ -f "${PREFIX}/lib/cmake/toml11/toml11Config.cmake" ]] && \
+   grep -q "${TOML11_VERSION}" "${PREFIX}/lib/cmake/toml11/toml11ConfigVersion.cmake" 2>/dev/null; then
+    echo "toml11 ${TOML11_VERSION} already installed, skipping."
+    exit 0
+fi
+
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 

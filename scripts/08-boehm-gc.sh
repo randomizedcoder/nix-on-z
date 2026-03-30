@@ -13,6 +13,12 @@ BUILD_DIR="${HOME}/bdwgc-build"
 PREFIX="/usr/local"
 JOBS="$(nproc)"
 
+# Skip if correct version is already installed
+if pkg-config --atleast-version="${GC_VERSION}" bdw-gc 2>/dev/null; then
+    echo "Boehm GC ${GC_VERSION} already installed, skipping."
+    exit 0
+fi
+
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 

@@ -11,6 +11,12 @@ BUILD_DIR="${HOME}/sqlite-build"
 PREFIX="/usr/local"
 JOBS="$(nproc)"
 
+# Skip if correct version is already installed
+if "${PREFIX}/bin/sqlite3" --version 2>/dev/null | grep -q "3.49.1"; then
+    echo "SQLite 3.49.1 already installed, skipping."
+    exit 0
+fi
+
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
@@ -36,5 +42,5 @@ echo "Installing SQLite..."
 sudo make install
 sudo ldconfig
 
-echo "Phase 7 complete: SQLite 3.49.1 installed."
+echo "Phase 7 complete: SQLite ${SQLITE_VERSION} installed."
 "${PREFIX}/bin/sqlite3" --version

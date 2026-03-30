@@ -25,26 +25,41 @@ echo "jq: $(jq --version 2>/dev/null || echo 'not found')"
 echo "sandbox shell: $(file /usr/bin/bash-static 2>/dev/null || echo 'not found')"
 echo ""
 
+# Parse individual test counts from a meson test log.
+# Meson prints a summary line like: "Ok:  1932  Expected Fail:  0  Fail:  0  ..."
+parse_test_counts() {
+    local logfile="$1"
+    local ok skip fail
+    ok=$(grep -oP 'Ok:\s+\K[0-9]+' "$logfile" | tail -n 1)
+    skip=$(grep -oP 'Skipped:\s+\K[0-9]+' "$logfile" | tail -n 1)
+    fail=$(grep -oP 'Fail:\s+\K[0-9]+' "$logfile" | tail -n 1)
+    echo "${ok:-0} ${skip:-0} ${fail:-0}"
+}
+
 # Unit tests (C++ GoogleTest)
 echo "--- Unit tests ---"
-unit_pass=0
-unit_fail=0
+total_unit_ok=0
+total_unit_fail=0
 for suite in nix-util-tests nix-store-tests nix-expr-tests nix-fetchers-tests nix-flake-tests; do
     echo ""
     echo "Running ${suite}..."
     if meson test -C "$BUILD_DIR" "$suite" --verbose --timeout-multiplier "$TIMEOUT_MULT" 2>&1 | tee "${RESULTS_DIR}/${suite}.log"; then
         echo "PASS: ${suite}"
-        unit_pass=$((unit_pass + 1))
     else
         echo "FAIL: ${suite} (see ${RESULTS_DIR}/${suite}.log)"
-        unit_fail=$((unit_fail + 1))
     fi
+    read -r ok skip fail < <(parse_test_counts "${RESULTS_DIR}/${suite}.log")
+    total_unit_ok=$((total_unit_ok + ok))
+    total_unit_fail=$((total_unit_fail + fail))
 done
 
 # Functional tests — all suites
 echo ""
 echo "--- Functional tests ---"
 func_suites=(main flakes ca dyn-drv git git-hashing local-overlay-store plugins libstoreconsumer)
+total_func_ok=0
+total_func_skip=0
+total_func_fail=0
 
 for suite in "${func_suites[@]}"; do
     echo ""
@@ -54,15 +69,18 @@ for suite in "${func_suites[@]}"; do
     else
         echo "SOME FAILURES in functional ${suite} (see ${RESULTS_DIR}/functional-${suite}.log)"
     fi
+    read -r ok skip fail < <(parse_test_counts "${RESULTS_DIR}/functional-${suite}.log")
+    total_func_ok=$((total_func_ok + ok))
+    total_func_skip=$((total_func_skip + skip))
+    total_func_fail=$((total_func_fail + fail))
 done
 
 # Summary
 echo ""
 echo "=== Summary ==="
-echo "Unit tests: ${unit_pass} passed, ${unit_fail} failed (out of 5 suites)"
-echo "Functional test logs saved to ${RESULTS_DIR}/functional-*.log"
+echo "Unit tests:       ${total_unit_ok} passed, ${total_unit_fail} failed"
+echo "Functional tests: ${total_func_ok} passed, ${total_func_fail} failed, ${total_func_skip} skipped"
 echo ""
-echo "To see per-test results:"
-echo "  grep -E '(OK|FAIL|SKIP)' ${RESULTS_DIR}/functional-main.log"
+echo "Logs saved to ${RESULTS_DIR}/"
 echo ""
 echo "Phase 17 complete: tests executed."

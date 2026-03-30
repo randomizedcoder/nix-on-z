@@ -13,6 +13,12 @@ JOBS="$(nproc)"
 export CC=/usr/local/bin/gcc
 export CXX=/usr/local/bin/g++
 
+# Skip if correct version is already installed
+if "${PREFIX}/bin/curl" --version 2>/dev/null | head -n 1 | grep -q "${CURL_VERSION}"; then
+    echo "curl ${CURL_VERSION} already installed, skipping."
+    exit 0
+fi
+
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
@@ -42,4 +48,4 @@ sudo make install
 sudo ldconfig
 
 echo "Phase 9 complete: curl ${CURL_VERSION} installed."
-"${PREFIX}/bin/curl" --version | head -1
+"${PREFIX}/bin/curl" --version | head -n 1

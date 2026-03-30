@@ -14,6 +14,13 @@ JOBS=1  # z machine has only 3.9 GiB RAM; >1 job OOMs during linking
 export CC=/usr/local/bin/gcc
 export CXX=/usr/local/bin/g++
 
+# Skip if correct version is already installed
+if [[ -f "${PREFIX}/include/boost/version.hpp" ]] && \
+   grep -q "BOOST_LIB_VERSION \"${BOOST_UNDERSCORE}\"" "${PREFIX}/include/boost/version.hpp" 2>/dev/null; then
+    echo "Boost ${BOOST_VERSION} already installed, skipping."
+    exit 0
+fi
+
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 

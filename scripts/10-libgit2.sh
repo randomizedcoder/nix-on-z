@@ -12,6 +12,12 @@ JOBS="$(nproc)"
 export CC=/usr/local/bin/gcc
 export CXX=/usr/local/bin/g++
 
+# Skip if correct version is already installed
+if pkg-config --exact-version="${LIBGIT2_VERSION}" libgit2 2>/dev/null; then
+    echo "libgit2 ${LIBGIT2_VERSION} already installed, skipping."
+    exit 0
+fi
+
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 

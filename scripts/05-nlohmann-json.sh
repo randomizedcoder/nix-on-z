@@ -10,6 +10,12 @@ NLOHMANN_URL="https://github.com/nlohmann/json/releases/download/v${NLOHMANN_VER
 BUILD_DIR="${HOME}/nlohmann-build"
 PREFIX="/usr/local"
 
+# Skip if correct version is already installed
+if pkg-config --exact-version="${NLOHMANN_VERSION}" nlohmann_json 2>/dev/null; then
+    echo "nlohmann_json ${NLOHMANN_VERSION} already installed, skipping."
+    exit 0
+fi
+
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 

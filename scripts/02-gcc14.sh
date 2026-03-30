@@ -12,6 +12,12 @@ OBJ_DIR="${BUILD_DIR}/objdir"
 PREFIX="/usr/local"
 JOBS=1  # z machine has only 3.9 GiB RAM; >1 job OOMs during linking
 
+# Skip if correct version is already installed
+if "${PREFIX}/bin/gcc" --version 2>/dev/null | head -n 1 | grep -q "${GCC_VERSION}"; then
+    echo "GCC ${GCC_VERSION} already installed, skipping."
+    exit 0
+fi
+
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
