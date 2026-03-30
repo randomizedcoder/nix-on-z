@@ -30,6 +30,7 @@ missing dependencies from source, then configure, build, and install Nix itself.
 | [ClickHouse Case Study](docs/example-clickhouse.md) | End-to-end porting example |
 | [Technical Reference](docs/technical-reference.md) | s390x architecture reference (replaces s390x-analysis.md) |
 | [Package Cross-Reference](docs/package-crossref.md) | 353 linux-on-ibm-z repos mapped to nixpkgs |
+| [IBM Z Patch Reuse](docs/ibm-z-patch-reuse.md) | Prioritized strategy for reusing linux-on-ibm-z patches |
 
 ## Architecture
 

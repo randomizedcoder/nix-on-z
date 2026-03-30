@@ -21,6 +21,7 @@ of already-ported software.
 | See what already works | [Current State](docs/current-state.md) — existing infrastructure and gaps |
 | Know what to work on next | [Priority Plan](docs/priority-plan.md) — dependency graph analysis |
 | Test an s390x build | [Porting Tests](docs/porting-testing.md) — cross-compilation, QEMU, native hardware |
+| Reuse IBM's existing patches | [IBM Z Patch Reuse](docs/ibm-z-patch-reuse.md) — linux-on-ibm-z patch strategy |
 | Submit a fix to nixpkgs | [Contributing](docs/contributing.md) — PR workflow and templates |
 | See a complex port worked end-to-end | [ClickHouse Case Study](docs/example-clickhouse.md) — SIMD, JIT, endianness, bundled deps |
 
@@ -116,6 +117,7 @@ docs/
 ├── blockers.md                  ← Big-endian blockers, implicit exclusions, analysis
 ├── priority-plan.md             ← Dependency graph analysis, tiered porting plan
 ├── porting-testing.md           ← Cross-compilation, QEMU, native hardware, test matrix
+├── ibm-z-patch-reuse.md         ← linux-on-ibm-z patch reuse strategy and priorities
 ├── contributing.md              ← PR workflow, fetchpatch patterns, templates
 ├── debugging.md                 ← Binary inspection, QEMU, nix queries, graph analysis SQL
 └── example-clickhouse.md        ← Case study: porting a complex C++ project end-to-end
