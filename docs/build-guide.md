@@ -6,60 +6,22 @@
 
 1. An s390x machine running Ubuntu 22.04 (e.g., IBM LinuxONE Community Cloud)
 2. A local workstation with SSH access to the s390x machine
-3. A fork or clone of [NixOS/nix](https://github.com/NixOS/nix)
+3. Nix installed on your workstation (for the flake workflow)
 
-## Step 1: Clone the repos
+## Option A: Nix Flake Workflow (Recommended)
 
-On your workstation, set up three repos side-by-side:
+The flake generates all bootstrap scripts from Nix definitions, bundles them
+with the patched Nix source, and provides deployment apps. This is the
+simplest and most reproducible approach.
+
+### Step 1: Clone
 
 ```bash
-cd ~/Downloads
-
-# This repo -- bootstrap scripts + patches
 git clone https://github.com/randomizedcoder/nix-on-z.git
-
-# NixOS/nix source
-git clone https://github.com/randomizedcoder/nix.git
-cd nix
-git checkout origin/master  # clean upstream master
-
-# RapidCheck fork with -fPIC fix for s390x
-cd ~/Downloads
-git clone -b nix-on-z https://github.com/randomizedcoder/rapidcheck.git
+cd nix-on-z
 ```
 
-## Step 2: Apply patches
-
-```bash
-cd ~/Downloads/nix
-git apply ../nix-on-z/patches/*.patch
-```
-
-Or apply individually:
-
-```bash
-git apply ../nix-on-z/patches/0001-add-s390x-support.patch
-git apply ../nix-on-z/patches/0002-fix-functional-tests-unbound-NIX_STORE.patch
-git apply ../nix-on-z/patches/0003-add-shell-test-variable.patch
-git apply ../nix-on-z/patches/0004-fix-fetchGitSubmodules-recursive-transport.patch
-git apply ../nix-on-z/patches/0005-fix-sandbox-ownership-check-non-root.patch
-git apply ../nix-on-z/patches/0006-fix-nix-develop-structured-attrs-outputs.patch
-git apply ../nix-on-z/patches/0007-fix-nested-sandboxing-skip-check.patch
-```
-
-Verify patches applied correctly:
-
-```bash
-grep '__s390x__' src/libmain/unix/stack.cc                        # Patch 1
-grep 'NIX_STORE-' tests/functional/common/vars.sh                 # Patch 2
-grep '^shell=' tests/functional/common/subst-vars.sh.in           # Patch 3
-grep 'protocol.file.allow=always' tests/functional/fetchGitSubmodules.sh  # Patch 4
-grep 'buildUser' src/libstore/unix/build/derivation-builder.cc | grep -c 'if (buildUser'  # Patch 5
-grep 'flakeInstallable' src/nix/develop.cc                        # Patch 6
-grep 'ls -A /nix/store' tests/functional/nested-sandboxing.sh     # Patch 7
-```
-
-## Step 3: Configure SSH
+### Step 2: Configure SSH
 
 Add an entry to `~/.ssh/config` so `ssh z` reaches the target machine:
 
@@ -69,88 +31,149 @@ Host z
   User <your-username>
 ```
 
-## Step 4: Sync to the s390x machine
+### Step 3: Sync to the s390x machine
 
 ```bash
-cd ~/Downloads/nix-on-z
-bash sync-to-z.sh
+nix run .#sync
 ```
 
-This rsyncs three things to the remote:
+This builds the source bundle (patching Nix source, generating all 18
+bootstrap scripts from `nix/z-scripts.nix`) and rsyncs to z:
 
-| Local path | Remote path | What |
-|---|---|---|
-| `~/Downloads/nix/` | `z:nix/` | Patched Nix source |
-| `~/Downloads/rapidcheck/` | `z:rapidcheck/` | RapidCheck fork with `-fPIC` fix |
-| `nix-on-z/*.sh` + `patches/` | `z:nix-on-z/` | Bootstrap scripts and patches |
+| Remote path | What |
+|---|---|
+| `z:nix/` | Patched Nix 2.35.0 source |
+| `z:rapidcheck/` | RapidCheck fork with `-fPIC` fix |
+| `z:nix-on-z/*.sh` | Generated bootstrap scripts |
+| `z:nix-on-z/patches/` | Patch files |
 
-## Step 5: Build everything on the s390x machine
+### Step 4: Build on z
 
 ```bash
+# Automated (runs all build scripts in order via SSH)
+nix run .#build-remote
+
+# Or manual (SSH in and run individually)
 ssh z
-
-# Phase 1: Install system packages and build toolchain
 cd ~/nix-on-z
-sudo bash 00-apt-deps.sh
-bash 01-meson-pip.sh
-bash 02-gcc14.sh              # ~2-4 hours at -j1
-source 03-env.sh
-
-# Phase 2: Build dependencies from source
-bash 04-boost.sh              # ~20-30 min at -j1
-bash 05-nlohmann-json.sh
-bash 06-toml11.sh
-bash 07-sqlite.sh
-bash 08-boehm-gc.sh
-bash 09-curl.sh
-bash 10-libgit2.sh
-bash 11-libseccomp.sh
-bash 12-blake3.sh
-
-# Phase 3: Build and install Nix
-source 03-env.sh
-cd ~/nix && bash ~/nix-on-z/13-nix-build.sh
-bash ~/nix-on-z/14-nix-install.sh
-nix --version                  # should print: nix (Nix) 2.35.0
+sudo bash 00-apt-deps.sh    # system packages
+bash 01-meson-pip.sh         # meson via pip
+bash 02-gcc14.sh             # GCC 14 (~2-4 hours at -j1)
+bash 04-boost.sh             # Boost 1.87 (~20-30 min at -j1)
+bash 05-nlohmann-json.sh     # nlohmann_json 3.11.3
+bash 06-toml11.sh            # toml11 4.4.0
+bash 07-sqlite.sh            # SQLite 3.49.1
+bash 08-boehm-gc.sh          # Boehm GC 8.2.8
+bash 09-curl.sh              # libcurl 8.17.0
+bash 10-libgit2.sh           # libgit2 1.9.0
+bash 11-libseccomp.sh        # libseccomp 2.5.5
+bash 12-blake3.sh            # BLAKE3 1.8.2
+bash 13-nix-build.sh         # configure + compile Nix
+bash 14-nix-install.sh       # install Nix + setup /nix/store
+nix --version                # nix (Nix) 2.35.0
 ```
+
+Note: scripts 04-14 have the environment setup (CC, CXX, PATH, etc.) inlined
+-- there is no need to manually `source 03-env.sh` before each one.
+`03-env.sh` is still generated for interactive use on z.
 
 Total time: ~3-5 hours (GCC 14 dominates).
 
-## Step 6: Run tests
+### Step 5: Run tests
 
 ```bash
-# Install test dependencies
+# Automated
+nix run .#test-remote
+
+# Or manual
+ssh z
 cd ~/nix-on-z
-bash 15-test-deps.sh           # GoogleTest, RapidCheck
-
-# Rebuild with tests enabled
-bash 16-nix-build-tests.sh
-
-# Verify the test environment
-bash 18-verify-test-env.sh     # should exit 0 with all PASS
-
-# Run all tests
-source 03-env.sh
-cd ~/nix
-bash ~/nix-on-z/17-run-tests.sh
+bash 15-test-deps.sh          # GoogleTest, RapidCheck, jq
+bash 16-nix-build-tests.sh    # rebuild with -Dunit-tests=true
+bash 18-verify-test-env.sh    # check prerequisites (should exit 0)
+bash 17-run-tests.sh          # run unit + functional suites
 ```
 
-Expected results: 1,932 unit tests pass, 178/0/30 functional pass/fail/skip.
+Expected results: 1,932 unit tests pass, 183/0/30 functional pass/fail/skip.
 
-## Step 7: Verify
+### Step 6: Verify
 
 ```bash
+ssh z
 nix --version
 # nix (Nix) 2.35.0
 
 nix --extra-experimental-features nix-command store info
 # Store URL: local
-# Version: 2.35.0
-# Trusted: 1
 
 nix --extra-experimental-features nix-command eval --expr '1 + 1'
 # 2
 ```
+
+### Validate locally
+
+```bash
+# Per-script shellcheck + patch verification
+nix flake check
+
+# Build source bundle and inspect generated scripts
+nix build .#source-bundle
+ls result/scripts/
+diff <(cat result/scripts/07-sqlite.sh) <(echo "expected content...")
+```
+
+## Option B: Manual Workflow (Without Nix on Workstation)
+
+If you don't have Nix on your workstation, you can build the source bundle
+scripts manually or clone the repos directly.
+
+### Step 1: Clone the repos
+
+```bash
+cd ~/Downloads
+
+# This repo
+git clone https://github.com/randomizedcoder/nix-on-z.git
+
+# NixOS/nix source
+git clone https://github.com/randomizedcoder/nix.git
+cd nix && git checkout origin/master && cd ..
+
+# RapidCheck fork with -fPIC fix for s390x
+git clone -b nix-on-z https://github.com/randomizedcoder/rapidcheck.git
+```
+
+### Step 2: Apply patches
+
+```bash
+cd ~/Downloads/nix
+git apply ../nix-on-z/patches/*.patch
+```
+
+### Step 3: Sync and build
+
+You'll need to sync the source and scripts to z manually with rsync, then
+follow the same build steps as Option A Step 4 above.
+
+## Script Design
+
+The bootstrap scripts were originally hand-written shell scripts in a
+`scripts/` directory. They have been migrated to Nix definitions in
+`nix/z-scripts.nix`, which generates each script as a Nix derivation.
+
+Each script is defined as `{ name, text, needsEnv }` and produces:
+
+- **`check`**: `writeShellApplication` -- shellcheck validation at build time
+- **`script`**: `writeTextFile` -- portable `#!/usr/bin/env bash` for z
+
+Scripts with `needsEnv = true` have the environment setup (GCC 14 paths,
+pkg-config, Boost) inlined from `nix/z-scripts/env.nix`, eliminating the
+need to manually source `03-env.sh`.
+
+All dependency versions and URLs are centralized in `nix/z-scripts/versions.nix`.
+
+Every script is idempotent (safe to re-run) and has version guards that skip
+if the correct version is already installed.
 
 ## Why So Many Dependencies From Source?
 
@@ -190,15 +213,16 @@ from source.
 
 ## Scripts
 
-Each script is self-contained, idempotent (safe to re-run), and prints a
-completion message on success. They install everything into `/usr/local`.
+Each script is generated from `nix/z-scripts.nix`, shellcheck-validated via
+`nix flake check`, idempotent (safe to re-run), and prints a completion
+message on success. They install everything into `/usr/local`.
 
 | Script | Phase | What it does | Time |
 |--------|-------|-------------|------|
 | `00-apt-deps.sh` | 0 | Installs Ubuntu packages, removes busybox-static, installs bash-static | ~2 min |
 | `01-meson-pip.sh` | 1 | Installs meson >= 1.1 via pip (Ubuntu ships 0.61) | ~1 min |
 | `02-gcc14.sh` | 2 | Builds GCC 14.2.0 from source for C++23 support | ~2-4 hrs |
-| `03-env.sh` | 3 | Sets CC, CXX, PATH, LD_LIBRARY_PATH, PKG_CONFIG_PATH (source, don't execute) | -- |
+| `03-env.sh` | 3 | Sets CC, CXX, PATH, LD_LIBRARY_PATH, PKG_CONFIG_PATH (for interactive use) | -- |
 | `04-boost.sh` | 4 | Builds Boost 1.87.0 (Ubuntu has 1.74, too old) | ~20-30 min |
 | `05-nlohmann-json.sh` | 5 | Installs nlohmann_json 3.11.3 (Ubuntu's 3.10.5 fails with GCC 14) | ~1 min |
 | `06-toml11.sh` | 6 | Installs toml11 4.4.0 (Ubuntu's apt pkg lacks cmake config files) | ~1 min |
@@ -210,16 +234,18 @@ completion message on success. They install everything into `/usr/local`.
 | `12-blake3.sh` | 12 | Builds BLAKE3 1.8.2 C library (not in Ubuntu) | ~1 min |
 | `13-nix-build.sh` | 13 | Configures and compiles Nix with meson | ~10-20 min |
 | `14-nix-install.sh` | 14 | Installs Nix, creates /nix/store, sets up nixbld users | ~2 min |
-| `15-test-deps.sh` | 15 | Builds GoogleTest 1.15.2 and RapidCheck from source | ~5 min |
+| `15-test-deps.sh` | 15 | Builds jq 1.7.1, GoogleTest 1.15.2, and RapidCheck from source | ~5 min |
 | `16-nix-build-tests.sh` | 16 | Reconfigures and rebuilds Nix with `-Dunit-tests=true` | ~10-20 min |
 | `17-run-tests.sh` | 17 | Runs unit tests and functional test suites, saves logs | ~15-30 min |
 | `18-verify-test-env.sh` | 18 | Diagnostic script: checks all test prerequisites, predicts failures | ~10 sec |
 
-### Helper
+## Flake Apps
 
-| Script | Purpose |
-|--------|---------|
-| `sync-to-z.sh` | rsync helper to push Nix source, RapidCheck source, and scripts to `z` |
+| App | Purpose |
+|-----|---------|
+| `nix run .#sync` | Build source bundle and rsync patched source + generated scripts to z |
+| `nix run .#build-remote` | SSH to z and run build scripts 00-14 in order |
+| `nix run .#test-remote` | SSH to z and run test scripts 15-17 in order |
 
 ## Low-Memory Considerations
 

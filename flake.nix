@@ -27,20 +27,22 @@
       # Native pkgs (x86_64) for build tools and non-cross packages
       pkgs = nixpkgs.legacyPackages.${system};
       sources = import ./nix/sources.nix { inherit (pkgs) fetchFromGitHub; };
+      zScripts = import ./nix/z-scripts.nix { inherit pkgs; };
     in {
       packages.${system} = {
         nix-s390x = import ./nix/nix-s390x.nix {
           inherit pkgs sources pkgsCross;
         };
         source-bundle = import ./nix/source-bundle.nix {
-          inherit pkgs sources self;
+          inherit pkgs sources self zScripts;
         };
       };
 
-      apps.${system} = import ./nix/deploy.nix { inherit pkgs self; };
+      apps.${system} = import ./nix/deploy.nix { inherit pkgs self zScripts; };
 
       devShells.${system}.default = import ./nix/devshell.nix { inherit pkgs; };
 
-      checks.${system} = import ./nix/checks.nix { inherit pkgs sources self; };
+      checks.${system} = import ./nix/checks.nix { inherit pkgs sources self; }
+        // zScripts.checks;
     };
 }

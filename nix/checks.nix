@@ -1,18 +1,8 @@
-# Flake checks: shellcheck on build scripts + patch application verification.
+# Flake checks: patch application verification.
+# Per-script shellcheck checks are provided by zScripts.checks (wired in flake.nix).
 { pkgs, sources, self }:
 
 {
-  shellcheck = pkgs.runCommand "shellcheck-scripts" {
-    nativeBuildInputs = [ pkgs.shellcheck ];
-    src = self;
-  } ''
-    cd "$src"
-    echo "Running shellcheck on scripts/*.sh..."
-    shellcheck --severity=warning --shell=bash scripts/*.sh
-    echo "All scripts pass shellcheck."
-    touch $out
-  '';
-
   patches-apply = pkgs.stdenvNoCC.mkDerivation {
     name = "verify-patches-apply";
     src = sources.nix.src;
