@@ -6,13 +6,31 @@
   outputs = { self, nixpkgs }:
     let
       system = "x86_64-linux";
+
+      # Cross-compilation pkgs with s390x hardware optimization.
+      # gcc.arch = "z13" enables vector extensions (SIMD) and sets the
+      # minimum architecture level. z13 (2015) is the oldest IBM Z still
+      # in production. This fixes cross-assembler failures (e.g., OpenSSL
+      # s390x assembly uses z10+ instructions like cijne) and enables
+      # hardware-accelerated CRC32 in zlib.
+      pkgsCross = import nixpkgs {
+        inherit system;
+        crossSystem = {
+          config = "s390x-unknown-linux-gnu";
+          gcc = {
+            arch = "z13";
+          };
+        };
+        overlays = [ (import ./nix/s390x-overlay.nix) ];
+      };
+
+      # Native pkgs (x86_64) for build tools and non-cross packages
       pkgs = nixpkgs.legacyPackages.${system};
       sources = import ./nix/sources.nix { inherit (pkgs) fetchFromGitHub; };
     in {
       packages.${system} = {
         nix-s390x = import ./nix/nix-s390x.nix {
-          inherit sources;
-          pkgsCross = pkgs.pkgsCross.s390x;
+          inherit pkgs sources pkgsCross;
         };
         source-bundle = import ./nix/source-bundle.nix {
           inherit pkgs sources self;
