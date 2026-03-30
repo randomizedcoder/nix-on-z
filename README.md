@@ -25,7 +25,11 @@ missing dependencies from source, then configure, build, and install Nix itself.
 | [Patches](docs/patches.md) | Eight patches for s390x support and test fixes, with root cause analysis |
 | [Testing](docs/testing.md) | Full test results, sandbox shell setup, and config.nix details |
 | [Build Guide](docs/build-guide.md) | Step-by-step reproduction: clone, patch, build, test, verify |
-| [s390x Analysis](docs/s390x-analysis.md) | Hardware capabilities, nixpkgs gaps, upstream patches, and IBM porting patterns |
+| [S390X Porting Guide](S390X-PORTING-GUIDE.md) | Master guide for porting nixpkgs packages to s390x |
+| [Priority Plan](docs/priority-plan.md) | Dependency-graph-ranked porting priorities |
+| [ClickHouse Case Study](docs/example-clickhouse.md) | End-to-end porting example |
+| [Technical Reference](docs/technical-reference.md) | s390x architecture reference (replaces s390x-analysis.md) |
+| [Package Cross-Reference](docs/package-crossref.md) | 353 linux-on-ibm-z repos mapped to nixpkgs |
 
 ## Architecture
 
