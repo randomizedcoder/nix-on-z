@@ -63,6 +63,15 @@ A scan of all of nixpkgs found just 3 packages using `badPlatforms = lib.platfor
 
 Both are nixpkgs packaging gaps — upstream already supports s390x.
 
+### Completed fixes (nix-on-z local patches)
+
+| Fix | What it enables |
+|-----|-----------------|
+| `gcc.arch=z13` in `lib/systems/examples.nix` | Vector extensions for all s390x cross-builds |
+| `s390x-multiplatform` in `lib/systems/platforms.nix` | Kernel config for s390x (bzImage, defconfig) |
+| `linux64-s390x` in OpenSSL | CPACF hardware crypto acceleration |
+| ClickHouse s390x support in `generic.nix` | Cross-compilation with SIMD disable, OpenSSL for gRPC, ICU BE fix |
+
 ## Top 10 s390x Target Libraries by Impact
 
 These cross-compiled libraries have the most downstream dependents. If any break, the

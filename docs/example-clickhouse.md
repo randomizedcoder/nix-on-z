@@ -10,10 +10,13 @@ intrinsics in query kernels, an embedded LLVM JIT compiler, BoringSSL for gRPC, 
 bundled C++ libraries, and serialization code that assumes little-endian byte order in
 "many places" (their maintainer's words).
 
-This document walks through what it would take to build ClickHouse for s390x via nixpkgs.
+This document walks through building ClickHouse for s390x via nixpkgs. Steps 1-6 have
+been implemented and the dry-run evaluation succeeds. The cross-compilation build is
+in progress.
+
 It serves two purposes:
 
-1. **A concrete porting plan** for anyone who wants to tackle ClickHouse
+1. **A concrete, partially-executed porting plan** for ClickHouse on s390x
 2. **A worked example** showing how the concepts in the [Porting Guide](../S390X-PORTING-GUIDE.md) apply to a real, complex package
 
 ## Why ClickHouse on s390x?
@@ -129,10 +132,10 @@ the current expression:
 | Compiler | LLVM/Clang 21 (`llvmPackages_21.stdenv`) |
 | Linker | LLD (`llvmPackages.lld`) |
 | Platforms | `lib.filter is64bit (linux ++ darwin)` — s390x IS included (64-bit) |
-| Cross-compilation | `broken = stdenv.buildPlatform != stdenv.hostPlatform` |
+| Cross-compilation | `broken` relaxed for s390x (`&& !stdenv.hostPlatform.isS390x`) |
 | Rust | Enabled by default |
-| x86 deps | `nasm`, `yasm` (x86 assemblers) |
-| s390x handling | None — zero references to `isS390x` or `isBigEndian` |
+| x86 deps | `nasm`, `yasm` (x86 assemblers, already guarded by `isx86_64`) |
+| s390x handling | CMake SIMD disable flags, OpenSSL for gRPC, ICU big-endian fix |
 
 ### The cross-compilation blocker
 
@@ -162,7 +165,7 @@ dependencies map to the s390x porting tiers:
 ### Tier 0 — Already working
 
 These are verified working for s390x cross-compilation (from our
-[test matrix](testing.md#initial-cross-compilation-test-matrix)):
+[test matrix](porting-testing.md#initial-cross-compilation-test-matrix)):
 
 | Dependency | Transitive Dependents | ClickHouse Uses It For |
 |------------|----------------------:|------------------------|
@@ -197,9 +200,9 @@ Once dependencies are handled, ClickHouse needs:
 
 ## Step-by-Step Porting Plan
 
-### Step 1: Relax the cross-compilation restriction
+### Step 1: Relax the cross-compilation restriction [DONE]
 
-The current blanket `broken` flag blocks all cross-builds. For s390x, we want to allow it:
+The current blanket `broken` flag blocks all cross-builds. For s390x, we allow it:
 
 ```nix
 # Before:
@@ -213,9 +216,9 @@ broken = stdenv.buildPlatform != stdenv.hostPlatform
 This keeps the `broken` flag for other cross-compilation targets (which haven't been
 tested) while unblocking s390x.
 
-### Step 2: Skip x86-only dependencies
+### Step 2: Skip x86-only dependencies [ALREADY DONE]
 
-`nasm` and `yasm` are x86 assemblers — useless on s390x:
+`nasm` and `yasm` are x86 assemblers — already guarded by `isx86_64` in the upstream expression:
 
 ```nix
 nativeBuildInputs = [
@@ -228,9 +231,9 @@ nativeBuildInputs = [
 ];
 ```
 
-### Step 3: Add s390x CMake flags
+### Step 3: Add s390x CMake flags [DONE]
 
-Disable x86 SIMD and the x86 `cmpxchg16b` flag:
+Disable x86 SIMD and force OpenSSL for gRPC:
 
 ```nix
 cmakeFlags = [
@@ -246,7 +249,7 @@ cmakeFlags = [
 ];
 ```
 
-### Step 4: Handle gRPC / BoringSSL
+### Step 4: Handle gRPC / BoringSSL [DONE]
 
 ClickHouse's gRPC interface uses BoringSSL by default. BoringSSL has no s390x assembly
 (see [Package Cross-Reference: boringssl](package-crossref.md)). The fix is to force
@@ -263,7 +266,7 @@ cmakeFlags = [
 This also unlocks **CPACF hardware crypto acceleration** — a net win over BoringSSL's
 software-only crypto on s390x.
 
-### Step 5: Handle bundled ICU
+### Step 5: Handle bundled ICU [DONE]
 
 ClickHouse bundles ICU for Unicode support. ICU's precompiled data tables are
 little-endian by default. For s390x, the data must be either:
@@ -281,7 +284,7 @@ postPatch = lib.optionalString stdenv.hostPlatform.isBigEndian ''
 '';
 ```
 
-### Step 6: Dry-run cross-compilation test
+### Step 6: Dry-run cross-compilation test [DONE]
 
 After making the Nix expression changes, verify that the build graph resolves:
 
@@ -292,9 +295,9 @@ nix build nixpkgs#pkgsCross.s390x.clickhouse --dry-run
 This doesn't compile anything — it just checks that all dependencies resolve and no
 `meta.platforms` or `broken` flags block the build.
 
-See: [Testing: Cross-Compilation](testing.md#cross-compilation-no-s390x-hardware-needed)
+See: [Testing: Cross-Compilation](porting-testing.md#cross-compilation-no-s390x-hardware-needed)
 
-### Step 7: QEMU user-mode test
+### Step 7: QEMU user-mode test [IN PROGRESS]
 
 Build and run with QEMU:
 
@@ -313,7 +316,7 @@ qemu-s390x result/bin/clickhouse local --version
 QEMU user-mode is slow (10-100x) but sufficient for basic functionality testing. Don't
 try to benchmark with it.
 
-See: [Testing: QEMU User-Mode](testing.md#qemu-user-mode-emulation)
+See: [Testing: QEMU User-Mode](porting-testing.md#qemu-user-mode-emulation)
 
 ### Step 8: Native hardware test
 
@@ -327,7 +330,7 @@ For real testing, use the **LinuxONE Community Cloud** (free tier):
 
 Native builds will expose runtime endianness issues that cross-compilation can't catch.
 
-See: [Testing: Native Hardware](testing.md)
+See: [Testing: Native Hardware](porting-testing.md)
 
 ## Hardware Acceleration Opportunities
 

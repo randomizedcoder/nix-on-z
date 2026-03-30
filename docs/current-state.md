@@ -34,7 +34,7 @@ These are the missing pieces that need to be addressed for full native s390x sup
 |-----|------|--------|
 | **Not in flake-systems** | `lib/systems/flake-systems.nix` | Cannot use `nixpkgs.legacyPackages.s390x-linux` in flakes natively |
 | **No `architectures.nix` entries** | `lib/systems/architectures.nix` | No `-march` flag variants (unlike x86-64-v2/v3/v4). s390x has z13/z14/z15/z16 but these aren't mapped |
-| **No `platforms.nix` kernel config** | `lib/systems/platforms.nix` | No Linux kernel config section for s390x (unlike aarch64, armv7l, riscv) |
+| **~~No `platforms.nix` kernel config~~** | `lib/systems/platforms.nix` | **Fixed**: `s390x-multiplatform` definition added with bzImage target, autoModules, defconfig |
 | **No musl bootstrap** | `pkgs/stdenv/linux/bootstrap-files/` | Only `s390x-unknown-linux-gnu.nix` exists — no `s390x-unknown-linux-musl.nix` |
 | **No native Hydra builder** | Hydra infrastructure | All s390x builds are cross-compiled from x86_64 — no native CI |
 
@@ -48,3 +48,24 @@ The s390x bootstrap tarballs were built via Hydra build **268609502** (August 20
 
 These are fetched from `https://hydra.nixos.org/build/268609502/download/1/` in
 `pkgs/stdenv/linux/bootstrap-files/s390x-unknown-linux-gnu.nix`.
+
+## nix-on-z Patches Applied (local nixpkgs clone)
+
+The following patches have been applied to our nixpkgs working copy on branch
+`s390x-clickhouse` and are candidates for upstream contribution:
+
+| Patch | File | Effect |
+|-------|------|--------|
+| `gcc.arch=z13` | `lib/systems/examples.nix` | Enables vector extension (VXE) instructions for s390x cross-builds |
+| `s390x-multiplatform` | `lib/systems/platforms.nix` | Adds platform definition + `select` clause (closes the gap above) |
+| OpenSSL `linux64-s390x` | `pkgs/development/libraries/openssl/default.nix` | Enables CPACF hardware crypto acceleration |
+| ClickHouse s390x | `pkgs/by-name/cl/clickhouse/generic.nix` | Relaxes broken flag, disables x86 SIMD, forces OpenSSL for gRPC, fixes ICU BE |
+
+### Dependency chain verification (dry-run)
+
+All critical ClickHouse dependencies evaluate for s390x cross-compilation:
+
+```
+hello zlib openssl cmake python3 perl rustc cargo llvm  — all pass --dry-run
+clickhouse                                               — passes --dry-run
+```
