@@ -22,14 +22,14 @@ from source, then configure, build, and install Nix itself.
 
 | Document | Description |
 |----------|-------------|
-| [Patches](docs/patches.md) | Seven patches for s390x support and test fixes, with root cause analysis |
+| [Patches](docs/patches.md) | Eight patches for s390x support and test fixes, with root cause analysis |
 | [Testing](docs/testing.md) | Full test results, sandbox shell setup, and config.nix details |
 | [Build Guide](docs/build-guide.md) | Step-by-step reproduction: clone, patch, build, test, verify |
-| [s390x Analysis](docs/s390x-analysis.md) | Endianness analysis and IBM porting patterns for nixpkgs |
+| [s390x Analysis](docs/s390x-analysis.md) | Hardware capabilities, nixpkgs gaps, upstream patches, and IBM porting patterns |
 
 ## Patches
 
-Seven patches are required. Two add s390x architecture support. Five fix test
+Eight patches are required. Two add s390x architecture support. Six fix test
 infrastructure bugs that affect all platforms (not s390x-specific).
 
 | Patch | File(s) | Category | Summary |
@@ -39,7 +39,8 @@ infrastructure bugs that affect all platforms (not s390x-specific).
 | 0003 | `subst-vars.sh.in`, `vars.sh` | all platforms | Add missing `$shell` test variable |
 | 0004 | `fetchGitSubmodules.sh` | all platforms | Fix recursive git submodule transport |
 | 0005 | `derivation-builder.cc` | all platforms | Fix sandbox ownership check for non-root builds |
-| 0006 | `develop.cc` | all platforms | Fix `nix develop -f` structured attrs + flake registry |
+| 0006a | `develop.cc` | all platforms | Fix `nix develop` structured attrs output variables |
+| 0006b | `develop.cc` | all platforms | Fix `nix develop -f` non-flake bashInteractive lookup |
 | 0007 | `nested-sandboxing.sh` | all platforms | Fix skip check for empty `/nix/store` |
 
 Details: [docs/patches.md](docs/patches.md)

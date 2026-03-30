@@ -2,7 +2,7 @@
 
 # Nix Source Patches
 
-Seven patches are required. Two add s390x architecture support. Five fix test
+Eight patches are required. Two add s390x architecture support. Six fix test
 infrastructure bugs that affect all platforms (not s390x-specific). Patches
 are applied to a clean checkout of [NixOS/nix](https://github.com/NixOS/nix)
 master.
@@ -16,7 +16,8 @@ master.
 | 0003 | `subst-vars.sh.in`, `vars.sh` | all platforms | Add missing `$shell` test variable |
 | 0004 | `fetchGitSubmodules.sh` | all platforms | Fix recursive git submodule transport |
 | 0005 | `derivation-builder.cc` | all platforms | Fix sandbox ownership check for non-root builds |
-| 0006 | `develop.cc` | all platforms | Fix `nix develop -f` structured attrs + flake registry |
+| 0006a | `develop.cc` | all platforms | Fix `nix develop` structured attrs output variables |
+| 0006b | `develop.cc` | all platforms | Fix `nix develop -f` non-flake bashInteractive lookup |
 | 0007 | `nested-sandboxing.sh` | all platforms | Fix skip check for empty `/nix/store` |
 
 ## Patch details
@@ -46,10 +47,17 @@ defined in the test infrastructure for non-NixOS systems.
 Gates the group/world-writable permission check on `buildUser` being non-null,
 fixing 9 C API test failures in non-root builds.
 
-### [Patch 6: Fix `nix develop` structured attrs](patches/0006-fix-nix-develop-structured-attrs.md)
+### Patch 6a: Fix `nix develop` structured attrs output variables
 
-Fixes two interacting bugs: a spurious flake registry lookup in non-flake mode
-and missing individual output variables (`$out`, `$dev`) for structured attrs.
+With structured attrs, outputs are stored in an associative array
+(`declare -A outputs=(...)`) but individual output variables like `$out` and
+`$dev` are not emitted. Emits them explicitly so `nix develop -c bash -c
+'test -n "$out"'` works.
+
+### Patch 6b: Fix `nix develop -f` non-flake bashInteractive lookup
+
+Fixes a spurious flake registry lookup in non-flake mode when resolving
+`bashInteractive` for the development shell.
 
 ### [Patch 7: Fix nested-sandboxing skip check](patches/0007-fix-nested-sandboxing-skip.md)
 
