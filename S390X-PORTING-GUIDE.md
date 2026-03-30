@@ -22,6 +22,7 @@ of already-ported software.
 | Know what to work on next | [Priority Plan](docs/priority-plan.md) — dependency graph analysis |
 | Test an s390x build | [Testing](docs/testing.md) — cross-compilation, QEMU, native hardware |
 | Submit a fix to nixpkgs | [Contributing](docs/contributing.md) — PR workflow and templates |
+| See a complex port worked end-to-end | [ClickHouse Case Study](docs/example-clickhouse.md) — SIMD, JIT, endianness, bundled deps |
 
 ## Key Findings
 
@@ -107,7 +108,8 @@ docs/
 ├── priority-plan.md             ← Dependency graph analysis, tiered porting plan
 ├── testing.md                   ← Cross-compilation, QEMU, native hardware, test matrix
 ├── contributing.md              ← PR workflow, fetchpatch patterns, templates
-└── debugging.md                 ← Binary inspection, QEMU, nix queries, graph analysis SQL
+├── debugging.md                 ← Binary inspection, QEMU, nix queries, graph analysis SQL
+└── example-clickhouse.md        ← Case study: porting a complex C++ project end-to-end
 ```
 
 ## Scope

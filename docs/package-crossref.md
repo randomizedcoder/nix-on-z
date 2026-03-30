@@ -56,6 +56,7 @@ nixpkgs equivalents.
 | `redis` | `pkgs.redis` | upstream | easy | Minor asm in `zmalloc`, JIT in jemalloc |
 | `sqlite` | `pkgs.sqlite` | upstream | trivial | Highly portable C |
 | `MongoDB` | `pkgs.mongodb` | patched | hard | Endianness in BSON, x86 asm in WiredTiger |
+| -- | `pkgs.clickhouse` | upstream | hard | x86 SIMD, BoringSSL, endianness in codecs; upstream has s390x toolchain + 6 merged BE fixes. **[Full case study](example-clickhouse.md)** |
 
 **Cross-compilation verification:**
 - `postgresql`: **PASS** — pulls in ICU, LLVM 21.1.8, readline, perl

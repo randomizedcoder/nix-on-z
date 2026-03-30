@@ -212,3 +212,4 @@ Packages requiring significant porting effort:
 | `bazel` | Complex platform detection | linux-on-ibm-z patches |
 | `chromium` | V8 JIT works, but Skia SIMD issues | linux-on-ibm-z patches |
 | `firefox` | SpiderMonkey JIT partially works | linux-on-ibm-z patches |
+| `clickhouse` | x86 SIMD, BoringSSL, endianness in codecs | Upstream s390x toolchain + merged BE fixes; **[full case study](example-clickhouse.md)** |
