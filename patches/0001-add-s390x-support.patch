@@ -7,7 +7,7 @@ index bec0d389f..6080c6f68 100644
  #elif defined(REG_ESP)
      sp = (char *) ((ucontext_t *) ctx)->uc_mcontext.gregs[REG_ESP];
 +#elif defined(__s390x__)
-+    sp = (char *) ((ucontext_t *) ctx)->uc_mcontext.gregs[15];
++    sp = (char *) ((ucontext_t *) ctx)->uc_mcontext.gregs[15]; /* R15 = stack pointer on s390x */
  #else
      haveSP = false;
  #endif

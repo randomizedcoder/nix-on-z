@@ -1,30 +1,11 @@
 diff --git a/src/nix/develop.cc b/src/nix/develop.cc
-index 29b44d780..d231c80ca 100644
+index a1b2c3f01..d231c80ca 100644
 --- a/src/nix/develop.cc
 +++ b/src/nix/develop.cc
-@@ -390,7 +390,17 @@ struct Common : InstallableCommand, MixProfile
-         StringMap rewrites;
-         if (buildEnvironment.providesStructuredAttrs()) {
-             for (auto & [outputName, from] : BuildEnvironment::getAssociative(outputs->second)) {
--                rewrites.insert({from, (outputsDir / outputName).string()});
-+                auto to = (outputsDir / outputName).string();
-+                rewrites.insert({from, to});
-+                /* With structured attrs, outputs are stored in an
-+                   associative array (declare -A outputs=(...)) but
-+                   individual output variables like $out and $dev are
-+                   not emitted by toBash().  Nix's stdenv setup.sh
-+                   extracts these from the array at build time, but
-+                   nix develop skips stdenv and sources the environment
-+                   directly.  Emit them here so that `nix develop -c
-+                   bash -c 'test -n "$out"'` works as expected. */
-+                script += fmt("export %s=%s\n", outputName, escapeShellArgAlways(to));
-             }
-         } else {
-             for (auto & outputName : BuildEnvironment::getStrings(outputs->second)) {
-@@ -638,42 +648,61 @@ struct CmdDevelop : Common, MixEnvironment
+@@ -654,42 +654,61 @@ struct CmdDevelop : Common, MixEnvironment
          std::filesystem::path shell = "bash";
          bool foundInteractive = false;
- 
+
 -        try {
 -            auto state = getEvalState();
 -
@@ -102,17 +83,17 @@ index 29b44d780..d231c80ca 100644
 +                    }
                  }
 -            }
- 
+
 -            if (!foundInteractive)
 -                throw Error("package 'nixpkgs#bashInteractive' does not provide a 'bin/bash'");
 +                if (!foundInteractive)
 +                    throw Error("package 'nixpkgs#bashInteractive' does not provide a 'bin/bash'");
- 
+
 -        } catch (Error &) {
 -            ignoreExceptionExceptInterrupt();
 +            } catch (Error &) {
 +                ignoreExceptionExceptInterrupt();
 +            }
          }
- 
+
          // Override SHELL with the one chosen for this environment.

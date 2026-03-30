@@ -24,7 +24,7 @@ index 8788c7d90..05f51edb4 100755
 +# When Nix is built from source (not installed via nixpkgs), these conditions
 +# are not met and the test cannot work.  The original check only tested for
 +# directory existence, not actual content.
-+if [[ ! -d /nix/store ]] || [[ -z "$(ls -A /nix/store 2>/dev/null)" ]]; then
++if [[ ! -d /nix/store ]] || [[ -z "$(find /nix/store -maxdepth 1 -mindepth 1 -print -quit 2>/dev/null)" ]]; then
 +    skipTest "nested sandboxing requires a populated /nix/store with Nix's runtime dependencies"
 +fi
  

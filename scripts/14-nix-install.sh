@@ -7,7 +7,6 @@ set -euo pipefail
 
 NIX_SRC="${HOME}/nix"
 BUILD_DIR="${NIX_SRC}/build"
-MESON_BIN="${HOME}/.local/bin/meson"
 PYTHON_SITE="$(python3 -c 'import site; print(site.getusersitepackages())')"
 
 if [[ ! -d "$BUILD_DIR" ]]; then

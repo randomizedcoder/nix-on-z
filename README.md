@@ -46,6 +46,27 @@ Details: [docs/patches.md](docs/patches.md)
 
 ## Quick Start
 
+### With Nix flake (recommended)
+
+```bash
+# Cross-compile for s390x from your workstation
+nix build .#nix-s390x
+file result/bin/nix  # ELF 64-bit MSB executable, IBM S/390
+
+# Or: prepare source + sync to z for native build
+nix run .#sync            # rsync patched source to z
+nix run .#build-remote    # build on z via ssh
+nix run .#test-remote     # run tests on z
+
+# Dev shell with tools
+nix develop
+
+# Verify patches + shellcheck
+nix flake check
+```
+
+### Without Nix (manual)
+
 ```bash
 # Clone repos
 git clone https://github.com/randomizedcoder/nix-on-z.git
@@ -56,7 +77,7 @@ git clone -b nix-on-z https://github.com/randomizedcoder/rapidcheck.git
 cd nix && git apply ../nix-on-z/patches/*.patch && cd ..
 
 # Sync to s390x machine and build
-cd nix-on-z && bash sync-to-z.sh
+cd nix-on-z && bash scripts/sync-to-z.sh
 ssh z 'cd ~/nix-on-z && sudo bash 00-apt-deps.sh && bash 01-meson-pip.sh && bash 02-gcc14.sh'
 ssh z 'source ~/nix-on-z/03-env.sh && cd ~/nix-on-z && for s in 04 05 06 07 08 09 10 11 12; do bash ${s}-*.sh; done'
 ssh z 'source ~/nix-on-z/03-env.sh && cd ~/nix && bash ~/nix-on-z/13-nix-build.sh && bash ~/nix-on-z/14-nix-install.sh'
