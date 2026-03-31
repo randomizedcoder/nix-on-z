@@ -11,8 +11,11 @@ bundled C++ libraries, and serialization code that assumes little-endian byte or
 "many places" (their maintainer's words).
 
 This document walks through building ClickHouse for s390x via nixpkgs. Steps 1-6 have
-been implemented and the dry-run evaluation succeeds. The cross-compilation build is
-in progress.
+been implemented and the dry-run evaluation succeeds. The cross-compilation build
+(Step 7) hit an architectural conflict between ClickHouse's hermetic build and Nix's
+packaging model after 8 fix iterations — see
+[Build Challenges](clickhouse-challenges.md) for the full analysis and strategy
+evaluation.
 
 It serves two purposes:
 
@@ -297,40 +300,117 @@ This doesn't compile anything — it just checks that all dependencies resolve a
 
 See: [Testing: Cross-Compilation](porting-testing.md#cross-compilation-no-s390x-hardware-needed)
 
-### Step 7: QEMU user-mode test [IN PROGRESS]
+### Step 7: Cross-compilation build [DEFERRED]
 
-Build and run with QEMU:
+The cross-compilation build ran through 11 iterations of fixes, each uncovering
+a deeper conflict between ClickHouse's hermetic build and Nix's cross-compilation
+wrappers. See [ClickHouse Build Challenges](clickhouse-challenges.md) for the full
+analysis.
 
+**Summary of fixes applied to `generic.nix`:**
+
+| Build | Fix | Status |
+|-------|-----|--------|
+| 1-2 | `-DOBJCOPY_PATH` / `-DSTRIP_PATH` for cross-tools | Working |
+| 3-4 | Patch `default_libs.cmake` to use Nix's prebuilt `libclang_rt.builtins-s390x.a` | Working |
+| 5 | `-DENABLE_ISAL_LIBRARY=OFF` (x86 Intel library) | Working |
+| 6 | `-DENABLE_HDFS=OFF` (requires x86 assembler) | Working |
+| 7 | `-DCMAKE_TOOLCHAIN_FILE=cmake/linux/toolchain-s390x.cmake` | Working |
+| 8 | Sub-cmake `execute_process` doesn't inherit cache vars | **Blocked** |
+| 9 | Unprefixed objcopy/strip/ar/ranlib symlinks in `preConfigure` | Working |
+| 10 | `-DCOMPILER_CACHE=disabled` in sub-cmake | Working |
+| 10-11 | Native (build-platform) compiler for sub-cmake | Implemented, untested |
+
+The remaining blocker is that ClickHouse's `CMakeLists.txt:669` `execute_process`
+builds native tools (protoc) using the **cross** compiler. Nix's cross-compiler
+wrapper produces s390x binaries, which can't execute on x86_64. The fix
+(`buildPackages.llvmPackages_21.clang-unwrapped`) is implemented in `generic.nix`
+but untested — we pivoted to a native build strategy instead.
+
+**Why deferred:** Each cross-compilation fix peels back a layer of conflict between
+two hermetic build systems that both want full toolchain control. A native build
+avoids this entirely. We can return to cross-compilation later with a known-good
+native binary as baseline.
+
+### Step 8: Native s390x build [IN PROGRESS]
+
+Building natively on s390x bypasses all cross-compilation issues. The s390x-specific
+changes (SIMD disable, OpenSSL for gRPC, ISAL/HDFS off, ICU BE fix) are already in
+`generic.nix` behind `isS390x` / `isBigEndian` guards. No toolchain file, no
+objcopy symlinks, no compiler-rt patch, no sub-cmake compiler override.
+
+**Current status:** Build started on z (2026-03-31) via `tmux` session `clickhouse`.
+Dry-run evaluation passed — 385 derivations to build (full bootstrap chain since
+no s390x binary cache). Running with `--cores 1 -j 1` to stay within 4GB RAM.
+Monitor via `ssh z "tail -20 ~/clickhouse-build.log"`.
+
+**Prerequisites:**
+- s390x machine with Nix installed (available via `ssh z`)
+- `system-features = big-parallel` in `/etc/nix/nix.conf` on z (ClickHouse
+  requires this feature flag)
+- Sync modified nixpkgs to z
+
+**Resource constraints (z machine):**
+- 2 vCPUs, 4GB RAM, 33GB free disk
+- ClickHouse takes 7+ hours on 2 cores and can use 8GB+ RAM during linking
+- May need swap configured, or `NIX_BUILD_CORES=1` to limit memory pressure
+- 33GB disk should be sufficient (ClickHouse build artifacts ~5-10GB)
+
+**Build steps:**
 ```bash
-# Build for s390x (will take a long time on x86)
-nix build nixpkgs#pkgsCross.s390x.clickhouse
+# From local machine: sync nixpkgs to z
+rsync -avz --delete \
+  --exclude='/.git/' --exclude='/result' \
+  ~/Downloads/z/nixpkgs/ z:nixpkgs/
 
-# Verify binary
+# On z: configure nix for big-parallel builds
+ssh z
+echo 'system-features = nixos-test benchmark big-parallel' | sudo tee -a /etc/nix/nix.conf
+sudo systemctl restart nix-daemon
+
+# Build ClickHouse natively (will take many hours on 2 cores)
+cd nixpkgs
+nix build .#clickhouse
+
+# Verify
 file result/bin/clickhouse
 # Expected: ELF 64-bit MSB executable, IBM S/390
 
-# Run with QEMU user-mode
+./result/bin/clickhouse local --version
+./result/bin/clickhouse local --query 'SELECT 1'
+```
+
+**Expected issues on native build:**
+- **Memory pressure**: Linking ClickHouse can require 8GB+. With 4GB RAM, the
+  OOM killer may intervene. Mitigation: add swap, or set `NIX_BUILD_CORES=1`
+- **Vendored sysroot deletion**: `postFetch` removes `contrib/sysroot/linux-*`
+  (for macOS case-insensitivity fix). Without the toolchain file, cmake should
+  use the system glibc — but some contrib cmake files may reference the sysroot
+  directory and fail when it's missing
+- **x86 assumptions in contrib**: Some of the 150+ bundled libraries may have
+  hardcoded x86 flags not guarded by architecture checks
+- **Rust**: Disabled in nixpkgs expression, but cmake may still probe
+
+### Step 9: Cross-compilation (future)
+
+Once the native build succeeds, return to cross-compilation:
+1. Use the native binary as a reference for correctness
+2. Fix the remaining sub-cmake compiler issue
+   (`buildPackages.llvmPackages_21.clang-unwrapped` for `execute_process`)
+3. Compare cross-built vs native-built binaries
+
+### Step 10: QEMU user-mode test (if cross-compiling)
+
+If cross-compiling from x86:
+
+```bash
+nix build .#pkgsCross.s390x.clickhouse
 qemu-s390x result/bin/clickhouse local --version
 ```
 
-QEMU user-mode is slow (10-100x) but sufficient for basic functionality testing. Don't
-try to benchmark with it.
+QEMU user-mode is slow (10-100x) but sufficient for basic functionality testing.
 
 See: [Testing: QEMU User-Mode](porting-testing.md#qemu-user-mode-emulation)
-
-### Step 8: Native hardware test
-
-For real testing, use the **LinuxONE Community Cloud** (free tier):
-
-1. Provision a LinuxONE instance
-2. Install Nix
-3. Build ClickHouse natively
-4. Run the ClickHouse test suite
-5. Benchmark against x86 results
-
-Native builds will expose runtime endianness issues that cross-compilation can't catch.
-
-See: [Testing: Native Hardware](porting-testing.md)
 
 ## Hardware Acceleration Opportunities
 
@@ -379,19 +459,28 @@ first-class citizen on s390x rather than a "it compiles" port.
 
 ## Challenge Summary
 
-| Challenge | Severity | Solution | Effort |
+| Challenge | Severity | Solution | Status |
 |-----------|----------|----------|--------|
-| Cross-compilation `broken` flag | Blocker | Relax for s390x | Trivial |
-| x86 assemblers (nasm/yasm) | Blocker | Skip on non-x86 | Trivial |
-| x86 SIMD intrinsics | Critical | CMake flags to disable | Easy |
-| `-mcx16` compiler flag | Low | Skip on s390x (native CAS) | Trivial |
-| Endianness (serialization) | High | Upstream has 6+ merged fixes; more will surface | Medium |
-| gRPC / BoringSSL | High | Force OpenSSL on s390x | Easy |
-| Bundled ICU BE data | Medium | Force BE mode or runtime swap | Medium |
-| LLVM JIT (SystemZ) | Medium | Verify SystemZ target enabled | Easy |
-| Bundled Arrow | Medium | Already disables SIMD on non-x86 | Easy |
-| Bundled RocksDB endianness | Medium | Upstream fix exists | Easy |
-| Rust components | Low | Disabled in nixpkgs already | None |
+| Cross-compilation `broken` flag | Blocker | Relax for s390x | Fixed |
+| x86 assemblers (nasm/yasm) | Blocker | Skip on non-x86 (already guarded) | Fixed |
+| x86 SIMD intrinsics | Critical | CMake flags to disable | Fixed |
+| `-mcx16` compiler flag | Low | Skip on s390x (native CAS) | Fixed |
+| gRPC / BoringSSL | High | Force OpenSSL on s390x | Fixed |
+| Bundled ICU BE data | Medium | Force BE mode via `platform.h` patch | Fixed |
+| Unprefixed objcopy/strip | Blocker | `-DOBJCOPY_PATH` / `-DSTRIP_PATH` | Fixed (top-level) |
+| compiler-rt cross-build | Blocker | Patch `default_libs.cmake` to use Nix's prebuilt lib | Fixed |
+| isa-l (x86 NASM) | Blocker | `-DENABLE_ISAL_LIBRARY=OFF` | Fixed |
+| libhdfs3 (x86 yasm) | Blocker | `-DENABLE_HDFS=OFF` | Fixed |
+| x86 sysroot flags on s390x | Blocker | `-DCMAKE_TOOLCHAIN_FILE=...toolchain-s390x.cmake` | Fixed |
+| Sub-cmake objcopy search | Blocker | PATH symlinks in `preBuild` (proposed) | **Blocked** |
+| Endianness (serialization) | High | Upstream has 6+ merged fixes; more will surface | Untested |
+| LLVM JIT (SystemZ) | Medium | Verify SystemZ target enabled | Untested |
+| Bundled Arrow | Medium | Already disables SIMD on non-x86 | Untested |
+| Bundled RocksDB endianness | Medium | Upstream fix exists | Untested |
+| Rust components | Low | Disabled in nixpkgs already | N/A |
+
+See [Build Challenges](clickhouse-challenges.md) for the full 8-iteration build log
+and strategy analysis.
 
 ## What Remains After Initial Port
 

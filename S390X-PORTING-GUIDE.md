@@ -120,7 +120,8 @@ docs/
 ├── ibm-z-patch-reuse.md         ← linux-on-ibm-z patch reuse strategy and priorities
 ├── contributing.md              ← PR workflow, fetchpatch patterns, templates
 ├── debugging.md                 ← Binary inspection, QEMU, nix queries, graph analysis SQL
-└── example-clickhouse.md        ← Case study: porting a complex C++ project end-to-end
+├── example-clickhouse.md        ← Case study: porting a complex C++ project end-to-end
+└── clickhouse-challenges.md    ← Build challenges: hermetic build conflicts, strategy analysis
 ```
 
 ## Scope
