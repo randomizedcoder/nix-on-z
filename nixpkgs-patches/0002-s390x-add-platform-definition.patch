@@ -1,0 +1,45 @@
+From: nix-on-z <nix-on-z@users.noreply.github.com>
+Subject: [PATCH 2/3] lib/systems/platforms: add s390x-multiplatform definition
+
+Add a platform definition for s390x (IBM Z), similar to existing
+definitions for aarch64, riscv, loongarch64, and ppc64.
+
+This provides:
+  - linux-kernel configuration with s390-specific target (bzImage)
+  - Proper platform selection in the `select` function
+
+Previously, s390x fell through to the empty `{}` default in
+platforms.select, meaning no platform-specific linux-kernel
+configuration was applied.
+
+diff --git a/lib/systems/platforms.nix b/lib/systems/platforms.nix
+index XXXXXXX..XXXXXXX 100644
+--- a/lib/systems/platforms.nix
++++ b/lib/systems/platforms.nix
+@@ -595,6 +595,16 @@
+     };
+   };
+
++  s390x-multiplatform = {
++    linux-kernel = {
++      name = "s390x-multiplatform";
++      target = "bzImage";
++      autoModules = true;
++      preferBuiltin = true;
++      baseConfig = "defconfig";
++    };
++  };
++
+   # This function takes a minimally-valid "platform" and returns an
+   # attrset containing zero or more additional attrs which should be
+   # included in the platform in order to further elaborate it.
+@@ -632,6 +642,9 @@
+     else if platform.isPower64 then
+       if platform.isLittleEndian then powernv else ppc64
+
++    else if platform.isS390x then
++      s390x-multiplatform
++
+     else if platform.isLoongArch64 then
+       loongarch64-multiplatform
+     else

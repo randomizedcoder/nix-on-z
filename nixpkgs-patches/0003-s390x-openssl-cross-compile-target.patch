@@ -1,0 +1,26 @@
+From: nix-on-z <nix-on-z@users.noreply.github.com>
+Subject: [PATCH 3/3] openssl: add s390x-linux cross-compilation target
+
+When cross-compiling OpenSSL for s390x, the configure script selection
+falls through to "linux-generic64", which misses s390x-specific
+optimizations:
+
+  - CPACF hardware crypto acceleration (AES, SHA, GHASH in hardware)
+  - s390x assembly-optimized routines
+  - Proper 64-bit s390x ABI handling
+
+OpenSSL has a dedicated "linux64-s390x" target that enables all of
+these. Add it to the platform-specific configureScript map, matching
+the pattern used for other architectures (ARM, x86_64, PPC, RISC-V).
+
+This is significant for performance: CPACF provides near-zero-cost
+AES-256 and SHA-256, which Nix uses extensively for store path hashing.
+
+diff --git a/pkgs/development/libraries/openssl/default.nix b/pkgs/development/libraries/openssl/default.nix
+index XXXXXXX..XXXXXXX 100644
+--- a/pkgs/development/libraries/openssl/default.nix
++++ b/pkgs/development/libraries/openssl/default.nix
+@@ -149,6 +149,7 @@
+           riscv64-linux = "./Configure linux64-riscv64";
++          s390x-linux = "./Configure linux64-s390x";
+         }
