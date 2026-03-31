@@ -339,10 +339,18 @@ changes (SIMD disable, OpenSSL for gRPC, ISAL/HDFS off, ICU BE fix) are already 
 `generic.nix` behind `isS390x` / `isBigEndian` guards. No toolchain file, no
 objcopy symlinks, no compiler-rt patch, no sub-cmake compiler override.
 
-**Current status:** Build started on z (2026-03-31) via `tmux` session `clickhouse`.
-Dry-run evaluation passed — 385 derivations to build (full bootstrap chain since
-no s390x binary cache). Running with `--cores 1 -j 1` to stay within 4GB RAM.
-Monitor via `ssh z "tail -20 ~/clickhouse-build.log"`.
+**Current status:** Build running on z (2026-03-31) via `tmux` session `clickhouse`.
+385 derivations to build (full bootstrap chain, no s390x binary cache). Running
+with `--cores 1 -j 1` to stay within 4GB RAM. Monitor via
+`ssh z "tail -20 ~/clickhouse-build.log"`.
+
+**First issue hit (zlib):** nixpkgs zlib 1.3.2 failed on s390x — its configure
+detects VX support and sets `-DHAVE_S390X_VX`, but doesn't add `-march=z13`
+(which implies `-mvx`) to CFLAGS for `contrib/crc32vx/crc32_vx.c`. Fixed by
+adding `-march=z13` to `NIX_CFLAGS_COMPILE` for s390x in `zlib/default.nix`.
+This is a pre-existing nixpkgs bug affecting all s390x builds, not ClickHouse-
+specific. See: [Fedora s390x-vectorize-crc32 patch](https://src.fedoraproject.org/rpms/zlib/blob/f34/f/zlib-1.2.11-s390x-vectorize-crc32.patch),
+[Ubuntu bug #2075567](https://bugs.launchpad.net/ubuntu/+source/zlib/+bug/2075567).
 
 **Prerequisites:**
 - s390x machine with Nix installed (available via `ssh z`)

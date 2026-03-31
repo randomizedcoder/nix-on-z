@@ -32,7 +32,9 @@ Patches that enable s390x hardware features (already supported upstream, need ni
 | **zlib** | `zlib` | DFLTCC enablement | DFLTCC (hardware deflate) | 95 dependents; 10-50x compression speedup |
 | **PCRE2** | `pcre2` + `sljit` | JIT backend | s390x JIT via SLJIT | 108 dependents; regex performance recovery |
 
-OpenSSL CPACF is already applied in our local nixpkgs. zlib DFLTCC and PCRE2 SLJIT are next.
+OpenSSL CPACF is already applied in our local nixpkgs. zlib VX CRC32 fix applied
+(`-march=z13` in CFLAGS, following Fedora/Ubuntu patches). zlib DFLTCC (`--dfltcc`
+configure flag) and PCRE2 SLJIT are next.
 
 ## Hard Problems with High Value
 
