@@ -20,7 +20,7 @@
     df -h / | tail -1
 
     DEAD_COUNT=$(nix-collect-garbage --dry-run 2>&1 | grep -oP '\d+ store paths' | grep -oP '\d+')
-    if [ "${DEAD_COUNT:-0}" -gt 0 ]; then
+    if [ "''${DEAD_COUNT:-0}" -gt 0 ]; then
       echo "  $DEAD_COUNT dead store paths found, collecting..."
       nix-collect-garbage 2>&1 | tail -1
     else

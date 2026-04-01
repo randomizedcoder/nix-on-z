@@ -457,19 +457,40 @@ different format (no per-core topology lines). Fix: add `"cpu_count_cores"` to
 `disabledTests` in `psutil/default.nix`. The test is architecture-specific, not a
 real bug — psutil's CPU counting works fine on s390x via other code paths.
 
+**Issue 7 — LLVM/Clang OOM and disk exhaustion:** Building Clang 21.1.8
+from source hit two resource limits on the LinuxONE Community Cloud VM:
+
+1. **OOM kill (4GB swap):** Linking `libclang-cpp.so.21.1` requires 7.2GB virtual
+   memory. With 4GB RAM + 4GB swap = 8GB total, the OOM killer terminated `ld`
+   (exit code 137). Fixed by increasing swap to 8GB (12GB total).
+
+2. **Disk full (50GB):** Even after GC freed 13.6GB, the nix store (16GB) + LLVM
+   build artifacts (~15GB) + 8GB swap file + OS fills the 50GB disk. The Clang
+   build fails at 1152/2258 files with "No space left on device".
+
+**Root cause:** The LinuxONE Community Cloud free tier (2 vCPU, 4GB RAM, 50GB disk)
+is undersized for bootstrapping the full Nix toolchain (GCC + LLVM + Clang + Rust)
+from source with no binary cache. A larger machine is needed.
+
+**Minimum recommended resources for full bootstrap:**
+- **RAM:** 8GB minimum (16GB recommended) — LLVM linking needs 7+ GB
+- **Disk:** 100GB minimum — nix store grows to 20-30GB, LLVM build needs 15GB,
+  plus swap and OS
+- **vCPUs:** 4+ recommended — LLVM has 4806 files, parallelism helps enormously
+
 #### Build configuration
 
-**Current status:** Build running on z (2026-03-31) via `tmux` session `clickhouse`.
-~385 derivations to build (full bootstrap chain, no s390x binary cache). Running
-with `--cores 2 -j 1` to use both CPU cores while limiting memory pressure.
-Monitor via `ssh z "tail -20 ~/clickhouse-build.log"`.
+**Current status:** Build blocked on disk space (2026-04-01). Requesting larger
+machine from LinuxONE Community Cloud. ~385 derivations to build (full bootstrap
+chain, no s390x binary cache). Running with `--cores 2 -j 1` to use both CPU cores
+while limiting memory pressure.
 
-**Resource constraints (z machine):**
-- 2 vCPUs (z15, 5.2 GHz), 4GB RAM, 33GB free disk
-- ClickHouse takes 7+ hours on 2 cores and can use 8GB+ RAM during linking
-- `--cores 2` uses both CPUs for parallel `make` within each derivation
-- `-j 1` builds one derivation at a time to avoid memory pressure
-- 33GB disk should be sufficient (ClickHouse build artifacts ~5-10GB)
+**Resource constraints (current z machine — undersized):**
+- 2 vCPUs (z15, 5.2 GHz), 4GB RAM, 50GB disk (too small)
+- LLVM/Clang linking needs 7+ GB RAM — requires 8GB swap with only 4GB RAM
+- Nix store grows to 16-20GB during bootstrap
+- LLVM build artifacts need ~15GB during compilation
+- 50GB disk cannot hold store + build artifacts + swap simultaneously
 
 **Build steps:**
 ```bash

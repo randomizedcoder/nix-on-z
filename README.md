@@ -113,13 +113,35 @@ Or clone and build manually on z -- see [docs/build-guide.md](docs/build-guide.m
 
 ## Target Environment
 
-| | |
-|---|---|
-| **Architecture** | s390x (IBM z16 / LinuxONE) |
-| **OS** | Ubuntu 22.04 LTS |
-| **RAM** | 3.9 GiB (scripts use `-j1` where needed to avoid OOM) |
-| **Disk** | ~45 GB free recommended |
-| **Nix version** | 2.35.0 (built from source) |
+All machines are provided by the [LinuxONE Community Cloud](https://developer.ibm.com/articles/get-started-with-ibm-linuxone/).
+
+| | **z** (original) | **z2** (current) |
+|---|---|---|
+| **Role** | Initial bootstrap & testing | Primary build server |
+| **Machine type** | 8561 (z15) | 8561 (z15) |
+| **vCPUs** | 2 | 4 |
+| **RAM** | 3.9 GiB | 15 GiB |
+| **Disk** | 50 GB | 99 GB |
+| **OS** | Ubuntu 22.04.5 LTS | Ubuntu 22.04.1 LTS |
+| **Clock** | 5.2 GHz | 5.2 GHz |
+| **L1 cache** | 128KB I + 128KB D / core | 128KB I + 128KB D / core |
+| **L2 cache** | 4MB / core | 4MB / core |
+| **L3 cache** | 256MB shared | 256MB shared |
+| **L4 cache** | 960MB shared | 960MB shared |
+| **Nix version** | 2.35.0 (built from source) | 2.35.0 (building) |
+| **SSH alias** | `z` | `z2` |
+
+**Why z2?** The original z machine (2 vCPU, 4GB RAM, 50GB disk) is too small
+for bootstrapping LLVM/Clang from source — the `libclang-cpp.so` link step
+needs 7+ GB RAM, and the nix store + build artifacts exceed 50GB. z2 has 4x
+the RAM, 2x the cores, and 2x the disk — enough for a full nixpkgs bootstrap.
+
+All deploy scripts support `Z_HOST=z2` to target the new machine:
+```bash
+Z_HOST=z2 nix run .#sync           # sync source to z2
+Z_HOST=z2 nix run .#build-remote   # build nix on z2
+Z_HOST=z2 nix run .#tune-ubuntu    # apply OS tuning to z2
+```
 
 ## License
 
