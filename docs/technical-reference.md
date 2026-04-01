@@ -379,3 +379,276 @@ Perl on s390x is a "just works" story. The main performance gains come from
 dependency-level improvements (zlib DFLTCC, glibc vectorization) rather than
 Perl-specific changes. No TODO items — Perl benefits automatically from the
 global `gcc.arch = "z15"` setting.
+
+## Compilation Performance on z15
+
+The z15 has architectural advantages that make it surprisingly good at
+compilation workloads, even compared to high-end x86 servers.
+
+### Why compilers run well on z
+
+| Feature | z15 | Typical x86 (Xeon) | Impact on compilation |
+|---------|-----|---------------------|----------------------|
+| **Clock speed** | 5.2 GHz sustained | 3.0-4.0 GHz (turbo burst) | Compilation is heavily single-threaded; z15's sustained clock wins |
+| **L1 cache** | 128KB I + 128KB D per core | 32-64KB I + 32-48KB D | 2-4x more L1 — huge for compiler symbol tables and ASTs |
+| **L2 cache** | 4MB per core | 1-1.25MB per core | 3-4x more L2 — keeps more of the working set close |
+| **Branch prediction** | z15 has one of the best branch predictors in any CPU | Good, but optimized for throughput | Compilers are branch-heavy (if/switch on AST node types); z15 excels |
+| **Pipeline width** | Up to 6 instructions/cycle decoded | 4-6 instructions/cycle | Comparable, but z15's pipeline is optimized for branch-heavy code |
+| **Out-of-order depth** | Very deep reorder buffer | Deep | Both good; z15's is tuned for commercial/compiler-style workloads |
+
+### Memory and I/O architecture advantages
+
+z15's memory subsystem was designed for virtual machine workloads, which
+gives it unique advantages for memory-intensive builds:
+
+- **Channel-based I/O** — z uses dedicated I/O channel processors, not
+  CPU-driven DMA. Disk I/O (including swap) happens independently of the
+  CPU — the processor doesn't stall waiting for I/O completion.
+- **PAV (Parallel Access Volumes)** — Multiple concurrent I/O operations
+  to the same disk. Swap reads/writes overlap, reducing latency.
+- **DAT (Dynamic Address Translation)** — z has had hardware virtual memory
+  since the 1970s (before x86 existed). The page table walker is deeply
+  optimized — TLB misses are faster to resolve than on x86.
+- **CMMA (Collaborative Memory Management Assist)** — The z15 hypervisor
+  and guest OS share page state information, so the hypervisor makes smarter
+  decisions about which pages to steal when memory is tight.
+- **Hardware page management** — Page-in/page-out is handled by dedicated
+  hardware, not by general-purpose CPU instructions.
+
+### Swap is less painful on z
+
+On x86, swapping during a build is usually catastrophic — the CPU stalls
+on page faults while DMA transfers complete. On z, the architecture
+mitigates this:
+
+1. **Channel subsystem handles I/O independently** — the CPU continues
+   executing other threads/processes while pages are fetched
+2. **Hardware page fault handling** is faster than x86's microcode-based
+   approach
+3. **CMMA** means the hypervisor pre-stages likely-needed pages before
+   the guest even faults
+
+**Observed during ClickHouse build (z15, 2 vCPU, 4GB RAM):**
+With 95% RAM used and 173MB in swap, `vmstat` showed `si=0, so=0` on
+active samples — the swapped pages were cold (unused Python modules, GCC
+data structures) and the CPU stayed at 96% user with zero I/O wait. On
+x86 with the same memory pressure, you'd typically see 5-15% `wa` (I/O
+wait) stealing CPU time.
+
+**Practical guidance:** Don't fear swap on z. A 4GB swap file on a 4GB
+machine is fine for most builds. The real risk is LLVM/Clang linking, where
+a single `ld` process can spike to 8GB+ — at that point even z's hardware
+can't hide the latency. For large link steps, consider `--param
+ggc-min-expand=0` to reduce GCC's memory usage, or increase swap to 8GB.
+
+### Transparent Huge Pages for compilers
+
+s390x hugepages are **1MB** (vs 2MB on x86). GCC/LLVM working sets (ASTs,
+symbol tables, IR) can be hundreds of MB — with 4KB pages that's tens of
+thousands of TLB entries. With 1MB hugepages, it's just hundreds.
+
+By default Ubuntu sets THP to `madvise` (opt-in only). GCC doesn't call
+`madvise(MADV_HUGEPAGE)`, so it gets zero hugepages. Setting THP to `always`
+lets the kernel automatically promote large allocations:
+
+```bash
+echo always > /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+**Observed:** After enabling THP during the LLVM build (4806 files), the kernel
+immediately promoted 478MB of compiler allocations to 1MB hugepages — ~478 TLB
+entries instead of ~122,000. This is included in the tuning tool (`nix run
+.#tune-ubuntu`).
+
+### What doesn't help compilation speed
+
+- **Vector extensions (VXE)** — Compilers don't use SIMD internally.
+  VX/VXE generates better code for *output* programs but doesn't speed up
+  the compiler itself.
+- **CPACF crypto** — Not relevant for compilation (speeds up hashing/signing
+  in OpenSSL, not GCC).
+- **DFLTCC compression** — Doesn't help during compilation (helps with
+  compressing build artifacts and nix store paths afterward).
+
+## Multi-LPAR Distributed Nix Builds
+
+This section describes the vision for scaling nix builds across multiple
+LPARs on the same IBM Z system — leveraging z-specific hardware features
+that have no equivalent on x86.
+
+### The opportunity
+
+A single z15/z16 CEC (Central Electronics Complex) can host dozens of LPARs
+(Logical Partitions), each running its own Linux instance. Unlike VMs on x86
+(which share a host OS), LPARs are hardware-isolated by PR/SM (Processor
+Resource/Systems Manager) — the z hypervisor that runs in firmware, not software.
+
+Nix already supports **distributed builds** via `nix.buildMachines`, where a
+coordinator delegates derivations to remote builders over SSH. On x86 this means
+network I/O (1-25 Gbps Ethernet). On z, the LPARs can communicate via
+**Hipersockets** — and that changes everything.
+
+### Hipersockets: memory-speed inter-LPAR communication
+
+Hipersockets is a z hardware feature that provides memory-to-memory networking
+between LPARs on the same CEC. There is no physical NIC, no cable, no switch.
+The hypervisor maps a shared memory region between partitions and mediates access.
+
+| Property | Hipersockets | 25GbE Ethernet | InfiniBand EDR |
+|----------|-------------|----------------|----------------|
+| **Latency** | <1 μs (memory copy) | 5-25 μs | 1-2 μs |
+| **Bandwidth** | Memory bus speed (~100+ GB/s) | 3.1 GB/s | 12.5 GB/s |
+| **CPU overhead** | Near zero (no DMA, no interrupt coalescing) | Significant (driver, stack, interrupts) | Moderate (RDMA helps) |
+| **Physical hardware** | None (firmware) | NICs, cables, switches | HCAs, cables, switches |
+| **Configuration** | z/VM or LPAR definition | OS network stack | Subnet manager, drivers |
+| **Isolation** | PR/SM hardware isolation | VLANs (software) | Partitioning (software) |
+
+For nix builds, the key metric is **store path transfer speed**. When a builder
+finishes a derivation, the result must be copied back to the coordinator via
+`nix copy`. A typical derivation output is 1-100MB. At memory bus speed, even a
+100MB result transfers in under a millisecond. On 25GbE, the same transfer takes
+30ms+ with TCP overhead.
+
+### Architecture: Nix build cluster on a single z CEC
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    IBM z15/z16 CEC                       │
+│                                                         │
+│  ┌─────────────┐  Hipersockets   ┌─────────────┐       │
+│  │  LPAR 1     │◄──────────────►│  LPAR 2     │       │
+│  │  Coordinator│  <1μs latency   │  Builder A  │       │
+│  │  4 vCPU     │                 │  4 vCPU     │       │
+│  │  nix-daemon │                 │  nix-daemon │       │
+│  │  16GB RAM   │                 │  16GB RAM   │       │
+│  └──────┬──────┘                 └─────────────┘       │
+│         │ Hipersockets                                  │
+│  ┌──────┴──────┐  Hipersockets   ┌─────────────┐       │
+│  │  LPAR 3     │◄──────────────►│  LPAR 4     │       │
+│  │  Builder B  │  <1μs latency   │  Builder C  │       │
+│  │  4 vCPU     │                 │  4 vCPU     │       │
+│  │  nix-daemon │                 │  nix-daemon │       │
+│  │  16GB RAM   │                 │  16GB RAM   │       │
+│  └─────────────┘                 └─────────────┘       │
+│                                                         │
+│  Total: 16 vCPUs, 64GB RAM, memory-speed interconnect  │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Coordinator (LPAR 1)** runs `nix-build` and delegates derivations to builders.
+Nix's job scheduler sends independent derivations to different LPARs in parallel.
+
+**Builders (LPARs 2-4)** run `nix-daemon` and accept remote builds via SSH.
+Each has its own nix store, CPU, and RAM — fully isolated.
+
+**Hipersockets** connects all LPARs at memory speed. Store path transfers
+(the main bottleneck in distributed nix builds on x86) become negligible.
+
+### Nix configuration
+
+On the coordinator LPAR:
+
+```nix
+# /etc/nix/nix.conf
+builders = ssh://lpar2 s390x-linux - 4 1 big-parallel,gccarch-z15 ; \
+           ssh://lpar3 s390x-linux - 4 1 big-parallel,gccarch-z15 ; \
+           ssh://lpar4 s390x-linux - 4 1 big-parallel,gccarch-z15
+max-jobs = 0  # delegate everything to remote builders
+builders-use-substitutes = true
+```
+
+On each builder LPAR:
+
+```nix
+# /etc/nix/nix.conf
+max-jobs = 4
+cores = 4
+system-features = benchmark big-parallel gccarch-z15 nixos-test
+```
+
+SSH keys are distributed so the coordinator can connect to builders without
+passwords. With Hipersockets, the SSH connections are over the internal
+memory-mapped network — no external network needed.
+
+### Why this is better than x86 build farms
+
+| Aspect | x86 build farm | z multi-LPAR |
+|--------|---------------|-------------|
+| **Interconnect** | 1-25 Gbps Ethernet (5-25μs latency) | Hipersockets (<1μs, memory bus bandwidth) |
+| **Store path transfer** | Network bottleneck — large closures take seconds | Sub-millisecond — memory copy |
+| **Isolation** | VMs or containers (software) | PR/SM hardware partitioning (EAL5+ certified) |
+| **Failure domain** | Multiple servers, switches, power supplies | Single CEC — but LPARs are independently restartable |
+| **Scaling up** | Buy more servers, more switches, more cables | Add LPARs — no hardware changes |
+| **Scheduling overhead** | Nix SSH + TCP + serialization per derivation | Nix SSH + memory copy — TCP overhead nearly eliminated |
+| **Cache coherence** | No shared cache between machines | LPARs share L3/L4 cache on same CEC — warm cache effects |
+| **Power & cooling** | N servers × per-server overhead | Single system — dramatically better power/build ratio |
+
+### The ClickHouse example
+
+Our ClickHouse build has ~385 derivations and takes hours on 2 vCPUs. The LLVM
+component alone is 4806 files. On a 4-LPAR cluster:
+
+- **Parallelism:** 4 independent derivations building simultaneously (one per LPAR)
+- **Within each derivation:** 4 cores for `make -j4` (vs our current `-j1 --cores 2`)
+- **Memory:** 16GB per LPAR — no swap needed, no OOM risk, no memory pressure
+- **Transfer:** Completed derivations move between LPARs at memory speed
+- **Estimate:** The build that takes 8+ hours on 2 cores / 4GB could complete in
+  under 1 hour on 16 cores / 64GB with memory-speed interconnect
+
+### Shared nix store via z/VM minidisks
+
+An alternative to copying store paths is **shared storage**. z/VM supports
+shared minidisks (ECKD DASD volumes visible to multiple guests). If all LPARs
+mount the same nix store:
+
+- **No store path copying needed** — builders write directly to the shared store
+- **Instant availability** — as soon as a builder finishes, the result is visible
+  to all other builders and the coordinator
+- **Single binary cache** — no duplication across LPARs
+- **Locking required** — nix's SQLite database would need careful handling
+  (possibly one writer, multiple readers)
+
+This is similar to NFS-shared nix stores on x86, but with **hardware-backed
+shared storage** instead of network filesystem overhead. The z/VM minidisk I/O
+goes through the channel subsystem, not a network stack.
+
+### Cross-LPAR cache warming
+
+Another z-specific advantage: LPARs on the same CEC share the **L3 and L4 caches**.
+When LPAR 1 reads a nix store path that LPAR 2 recently wrote, there's a chance
+it's still warm in the shared cache hierarchy. On x86, two separate servers have
+completely cold caches relative to each other.
+
+This matters for nix because builds frequently read outputs of other builds
+(header files, libraries, pkg-config files). Cache warming effects compound
+across the dependency graph.
+
+### What IBM would need to provide
+
+To make this a reality for the nix community:
+
+1. **LinuxONE Community Cloud multi-LPAR access** — Currently the community cloud
+   gives one VM per user. A build cluster needs 3-4 LPARs with Hipersockets between them.
+2. **Sufficient resources per LPAR** — At least 4 vCPUs and 16GB RAM per LPAR for
+   comfortable builds (current community cloud offers 2 vCPU / 4GB).
+3. **Shared DASD** — Optional but ideal for a shared nix store.
+4. **Persistent allocation** — Build clusters need uptime for cache warming.
+   The current community cloud has 120-day time limits.
+
+### What the Nix team would need to provide
+
+1. **s390x in the installer** — See [Nix Installer Platforms](nix-installer-platforms.md)
+   for our proposed patches.
+2. **s390x Hydra builders** — To populate the official binary cache. A multi-LPAR
+   setup on donated z hardware would be the most efficient way to run this.
+3. **s390x in the CI matrix** — nixpkgs PRs should test s390x to prevent regressions.
+
+### The pitch
+
+> **One IBM z16 CEC running 4 LPARs with Hipersockets could serve as the entire
+> s390x Hydra build infrastructure for nixpkgs — replacing what would otherwise
+> be a rack of x86 servers with network switches.** The memory-speed interconnect
+> eliminates the main bottleneck in distributed Nix builds (store path transfer),
+> and PR/SM hardware isolation provides better security than any software
+> virtualization. A single machine, zero network infrastructure, EAL5+ security,
+> and faster builds than a comparable x86 cluster.

@@ -450,6 +450,13 @@ reported on Alpine Linux. Fixed by adding `!stdenv.hostPlatform.isS390x` to the
 `doInstallCheck` guard in `bison/package.nix`. Tests are skipped, not fixed.
 Sources: [bug-bison mailing list](https://www.mail-archive.com/bug-bison@gnu.org/msg04052.html).
 
+**Issue 6 — psutil test_cpu_count_cores (skipped):** Python's `psutil` package
+fails its `test_cpu_count_cores` test on s390x. The test parses `/proc/cpuinfo`
+expecting x86-style `core id` / `physical id` fields, but s390x uses a completely
+different format (no per-core topology lines). Fix: add `"cpu_count_cores"` to
+`disabledTests` in `psutil/default.nix`. The test is architecture-specific, not a
+real bug — psutil's CPU counting works fine on s390x via other code paths.
+
 #### Build configuration
 
 **Current status:** Build running on z (2026-03-31) via `tmux` session `clickhouse`.

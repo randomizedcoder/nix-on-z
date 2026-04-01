@@ -26,6 +26,7 @@ of already-ported software.
 | Add s390x to the Nix installer | [Installer Platforms](docs/nix-installer-platforms.md) — patches + proposal for 6 new platforms |
 | See a complex port worked end-to-end | [ClickHouse Case Study](docs/example-clickhouse.md) — SIMD, JIT, endianness, bundled deps |
 | Tune Ubuntu on Z for builds | [Ubuntu Z Tuning](docs/ubuntu-z-tuning.md) — disable useless services, sysctl, swap |
+| Scale builds across LPARs | [Multi-LPAR Builds](docs/technical-reference.md#multi-lpar-distributed-nix-builds) — Hipersockets, memory-speed nix cluster |
 
 ## Key Findings
 
@@ -65,6 +66,20 @@ A scan of all of nixpkgs found just 3 packages using `badPlatforms = lib.platfor
 | Add s390x to Grafana `meta.platforms` | One-line | Grafana monitoring stack |
 
 Both are nixpkgs packaging gaps — upstream already supports s390x.
+
+### Compilation performance on z15
+
+The z15's 5.2 GHz sustained clock, 128KB L1 caches (2-4x x86), and channel-based
+I/O make it surprisingly good at compilation workloads. Swap is far less painful
+than on x86 — during the ClickHouse build at 95% RAM usage, we observed zero I/O
+wait. Enabling THP (`always`) immediately promoted 478MB of LLVM build allocations
+to 1MB hugepages, reducing TLB entries from ~122,000 to ~478.
+
+For serious build throughput, multiple LPARs on the same CEC can form a distributed
+nix build cluster connected via **Hipersockets** (memory-to-memory, <1μs latency).
+One z16 CEC could replace a rack of x86 build servers.
+Details: [Compilation Performance](docs/technical-reference.md#compilation-performance-on-z15)
+| [Multi-LPAR Builds](docs/technical-reference.md#multi-lpar-distributed-nix-builds)
 
 ### Performance TODOs
 

@@ -126,14 +126,18 @@ net.ipv4.tcp_reflect_tos = 1
 
 SYSCTL
 
-    # Transparent Hugepages: set to madvise (not a sysctl — done via sysfs).
-    # s390x hugepages are 1MB (not 2MB like x86). With only 4GB RAM, we don't
-    # want THP aggressively allocating 1MB pages for every malloc. madvise lets
-    # the JVM and linker explicitly request them while builds use normal 4KB pages.
+    # Transparent Hugepages: set to "always" for build workloads.
+    # s390x hugepages are 1MB (vs 2MB on x86). GCC/LLVM working sets (ASTs,
+    # symbol tables, IR) can be hundreds of MB — with 4KB pages that's tens of
+    # thousands of TLB entries. With 1MB hugepages, it's just hundreds.
+    # Observed: enabling THP during the LLVM build immediately promoted 478MB
+    # of compiler allocations to 1MB hugepages (~478 TLB entries vs ~122,000).
+    # Note: "always" is better than "madvise" for builds because GCC doesn't
+    # call madvise(MADV_HUGEPAGE) — it needs the kernel to promote automatically.
     if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
-      echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+      echo always > /sys/kernel/mm/transparent_hugepage/enabled
       echo defer+madvise > /sys/kernel/mm/transparent_hugepage/defrag
-      echo "  THP set to madvise (s390x hugepages are 1MB, not 2MB)"
+      echo "  THP set to always (s390x 1MB hugepages for compiler workloads)"
     fi
 
     sysctl --system >/dev/null
