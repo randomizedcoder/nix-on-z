@@ -21,11 +21,15 @@ let
     (import ./disable-irqbalance.nix)
     (import ./disable-networkd-dispatcher.nix)
     (import ./disable-getty-tty1.nix)
+    (import ./disable-motd-news.nix)
 
     # System tuning
     (import ./sysctl.nix)
     (import ./swap.nix)
     (import ./nix-limits.nix)
+
+    # Pre-build cleanup
+    (import ./pre-build-gc.nix)
   ];
 
   # Combine all module scripts into one, with a header per module.

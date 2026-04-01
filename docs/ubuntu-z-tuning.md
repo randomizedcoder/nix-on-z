@@ -294,6 +294,42 @@ echo 1 > /sys/bus/ccw/devices/0.0.0150/online
 
 LinuxONE Community Cloud uses virtio-blk, not DASD, so these don't apply there.
 
+## Pre-Build Garbage Collection
+
+**This saved our ClickHouse build from running out of disk.**
+
+When iterating on s390x fixes — trying a build, hitting an error, patching,
+rebuilding — each failed attempt leaves behind partial store paths. On a 50GB
+disk these accumulate silently. We discovered **5.7GB of dead paths** from just
+a few iterations of fixing OpenSSL, PCRE2, and bison:
+
+```
+$ nix-collect-garbage --dry-run
+2844 store paths would be deleted
+
+$ nix-collect-garbage
+2844 store paths deleted, 5.7 GiB freed
+
+$ df -h /
+/dev/dasda1   50G   33G   15G  70%  /    # was 85% before GC
+```
+
+Without this cleanup, the ClickHouse build (which needs 5-10GB of build
+artifacts on top of the existing 15-20GB nix store) would have run out of
+disk mid-compilation.
+
+**Safety:** `nix-collect-garbage` only removes paths with no GC roots — it will
+not touch anything referenced by a running build, current profiles, or `result`
+symlinks. It's safe to run even while a build is in progress.
+
+The `tune-ubuntu` app runs this as its final step, after all service disables
+and sysctl tuning. This ensures maximum disk headroom before kicking off a
+long build.
+
+**Recommendation:** Always run `nix run .#tune-ubuntu` (or at minimum
+`nix-collect-garbage`) before starting a multi-hour build on a
+resource-constrained VM.
+
 ## Automated Tool
 
 All of the above is implemented as modular Nix derivations in `nix/z-tuning/`:
@@ -311,9 +347,11 @@ nix/z-tuning/
 ├── disable-irqbalance.nix           # negligible on 2-vCPU
 ├── disable-networkd-dispatcher.nix  # static network, no events
 ├── disable-getty-tty1.nix           # no physical display
+├── disable-motd-news.nix           # wget to Canonical on every login
 ├── sysctl.nix                       # memory, network, and s390x-specific
 ├── swap.nix                         # 4GB swap for linker survival
-└── nix-limits.nix                   # nix build user file/process limits
+├── nix-limits.nix                   # nix build user file/process limits
+└── pre-build-gc.nix                 # garbage collect dead store paths
 ```
 
 Each file has detailed comments explaining the reasoning. To apply:
