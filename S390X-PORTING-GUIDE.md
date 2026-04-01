@@ -23,7 +23,9 @@ of already-ported software.
 | Test an s390x build | [Porting Tests](docs/porting-testing.md) — cross-compilation, QEMU, native hardware |
 | Reuse IBM's existing patches | [IBM Z Patch Reuse](docs/ibm-z-patch-reuse.md) — linux-on-ibm-z patch strategy |
 | Submit a fix to nixpkgs | [Contributing](docs/contributing.md) — PR workflow and templates |
+| Add s390x to the Nix installer | [Installer Platforms](docs/nix-installer-platforms.md) — patches + proposal for 6 new platforms |
 | See a complex port worked end-to-end | [ClickHouse Case Study](docs/example-clickhouse.md) — SIMD, JIT, endianness, bundled deps |
+| Tune Ubuntu on Z for builds | [Ubuntu Z Tuning](docs/ubuntu-z-tuning.md) — disable useless services, sysctl, swap |
 
 ## Key Findings
 
@@ -64,13 +66,24 @@ A scan of all of nixpkgs found just 3 packages using `badPlatforms = lib.platfor
 
 Both are nixpkgs packaging gaps — upstream already supports s390x.
 
+### Performance TODOs
+
+| Improvement | Effort | Impact | Details |
+|-------------|--------|--------|---------|
+| CPython PGO + LTO (`--enable-optimizations --with-lto`) | Low | 5-15% Python speedup | [Python on s390x](docs/technical-reference.md#python-on-s390x) |
+| Switch zlib to zlib-ng (DFLTCC hardware deflate) | Medium | 10-50x compression on z15+ | [Hardware Compression](docs/technical-reference.md#hardware-compression) |
+| PEP 744 JIT for s390x | Hard (upstream) | 10-30% Python speedup | [PEP 744 gap](docs/technical-reference.md#pep-744-jit-compilation--not-available-on-s390x) — no s390x backend exists |
+
 ### Completed fixes (nix-on-z local patches)
 
 | Fix | What it enables |
 |-----|-----------------|
-| `gcc.arch=z13` in `lib/systems/examples.nix` | Vector extensions for all s390x cross-builds |
+| `gcc.arch=z15` in `platforms.nix` + `examples.nix` | z15 codegen globally (DFLTCC, VXE3, CPACF). Requires `gccarch-z15` in nix system-features |
 | `s390x-multiplatform` in `lib/systems/platforms.nix` | Kernel config for s390x (bzImage, defconfig) |
-| `linux64-s390x` in OpenSSL | CPACF hardware crypto acceleration |
+| `CFLAGS=-march=${gcc.arch or "z10"}` in OpenSSL | Fixes assembler error (`CIJNE` unrecognized on z900 default) + CPACF crypto |
+| `-march=z13` in zlib CFLAGS | VX CRC32 vectorized checksum (Fedora/Ubuntu patch) |
+| PCRE2 JIT re-enabled for s390x | SLJIT s390x backend (available since PCRE2 10.39) |
+| `nix run .#check-arch` hardware detection | Auto-detects machine type, recommends optimal `gcc.arch` |
 | ClickHouse s390x support in `generic.nix` | Cross-compilation with SIMD disable, OpenSSL for gRPC, ICU BE fix |
 
 ## Top 10 s390x Target Libraries by Impact
@@ -121,6 +134,9 @@ docs/
 ├── contributing.md              ← PR workflow, fetchpatch patterns, templates
 ├── debugging.md                 ← Binary inspection, QEMU, nix queries, graph analysis SQL
 ├── example-clickhouse.md        ← Case study: porting a complex C++ project end-to-end
+├── ubuntu-z-tuning.md           ← Disable useless Ubuntu services, sysctl tuning, swap setup
+├── nix-installer-platforms.md   ← Proposal: add s390x + 5 more platforms to Nix installer
+├── patches/nix-installer/       ← Patches for install.in, flake.nix, hydra.nix
 └── clickhouse-challenges.md    ← Build challenges: hermetic build conflicts, strategy analysis
 ```
 

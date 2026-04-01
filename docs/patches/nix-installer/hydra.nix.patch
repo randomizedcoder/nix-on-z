@@ -1,0 +1,27 @@
+--- a/packaging/hydra.nix
++++ b/packaging/hydra.nix
+@@ -273,11 +273,23 @@
+   installerScript = installScriptFor [
+     # Native
+     self.hydraJobs.binaryTarball."x86_64-linux"
+     self.hydraJobs.binaryTarball."i686-linux"
+     self.hydraJobs.binaryTarball."aarch64-linux"
+     self.hydraJobs.binaryTarball."x86_64-darwin"
+     self.hydraJobs.binaryTarball."aarch64-darwin"
+-    # Cross
++    # Cross — Tier 1 (existing)
+     self.hydraJobs.binaryTarballCross."x86_64-linux"."armv6l-unknown-linux-gnueabihf"
+     self.hydraJobs.binaryTarballCross."x86_64-linux"."armv7l-unknown-linux-gnueabihf"
+     self.hydraJobs.binaryTarballCross."x86_64-linux"."riscv64-unknown-linux-gnu"
++    # Cross — Tier 2 (new platforms)
++    # IBM Z / LinuxONE — enterprise mainframes, LinuxONE Community Cloud
++    self.hydraJobs.binaryTarballCross."x86_64-linux"."s390x-unknown-linux-gnu"
++    # IBM POWER little-endian — HPC, AI, OpenPOWER Foundation hardware
++    self.hydraJobs.binaryTarballCross."x86_64-linux"."powerpc64le-unknown-linux-gnu"
++    # IBM POWER big-endian — Talos II/Lite workstations (libre hardware)
++    self.hydraJobs.binaryTarballCross."x86_64-linux"."powerpc64-unknown-linux-gnu"
++    # LoongArch — emerging Chinese architecture (Loongson 3A5000/6000)
++    self.hydraJobs.binaryTarballCross."x86_64-linux"."loongarch64-unknown-linux-gnu"
++    # RISC-V 32-bit — embedded/IoT (ESP32-C3, GD32VF103, etc.)
++    self.hydraJobs.binaryTarballCross."x86_64-linux"."riscv32-unknown-linux-gnu"
+   ];

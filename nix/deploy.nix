@@ -74,6 +74,83 @@ in
     '';
   });
 
+  check-arch = mkApp (pkgs.writeShellApplication {
+    name = "nix-on-z-check-arch";
+    runtimeInputs = [ pkgs.openssh ];
+    text = ''
+      Z_HOST="''${Z_HOST:-z}"
+      echo "Checking s390x hardware on $Z_HOST..."
+      # shellcheck disable=SC2029
+      ssh "$Z_HOST" 'bash -s' <<'REMOTE_SCRIPT'
+
+      CURRENT_ARCH="''${1:-z13}"
+
+      if [[ ! -f /proc/cpuinfo ]]; then
+        echo "ERROR: /proc/cpuinfo not found. Are you running on s390x?"
+        exit 1
+      fi
+
+      MACHINE_TYPE=$(grep -m1 "^processor.*machine" /proc/cpuinfo | awk "{print \$NF}")
+      FEATURES=$(grep "^features" /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)
+      CPUS=$(grep "^# processors" /proc/cpuinfo | awk "{print \$NF}")
+
+      echo "=== IBM Z Hardware Detection ==="
+      echo "Machine type:    $MACHINE_TYPE"
+      echo "Processors:      ''${CPUS:-unknown}"
+      echo "CPU features:    $FEATURES"
+      echo ""
+
+      # Machine type -> gcc -march mapping
+      # See: https://gcc.gnu.org/onlinedocs/gcc/S_002f390-and-zSeries-Options.html
+      case "$MACHINE_TYPE" in
+        2964|2965) DETECTED_ARCH="z13";   YEAR="2015"; HW_FEATURES="VXE (vector extensions)" ;;
+        3906|3907) DETECTED_ARCH="z14";   YEAR="2017"; HW_FEATURES="VXE2, misc-insn-ext-2" ;;
+        8561|8562) DETECTED_ARCH="z15";   YEAR="2019"; HW_FEATURES="VXE3, DFLTCC (hardware deflate), sort" ;;
+        3931|3932) DETECTED_ARCH="z16";   YEAR="2022"; HW_FEATURES="NNPA (AI accelerator), bear-enh-1" ;;
+        9175)      DETECTED_ARCH="arch15"; YEAR="2025"; HW_FEATURES="z17 features (requires GCC 15+)" ;;
+        *)         echo "WARNING: Unknown machine type $MACHINE_TYPE"; exit 1 ;;
+      esac
+
+      # Arch level ordering for comparison
+      arch_level() {
+        case "$1" in
+          z13) echo 5 ;; z14) echo 6 ;; z15) echo 7 ;;
+          z16) echo 8 ;; arch15) echo 9 ;; *) echo 0 ;;
+        esac
+      }
+
+      echo "Detected:        $DETECTED_ARCH ($YEAR) — $HW_FEATURES"
+      echo "Configured:      gcc.arch = \"$CURRENT_ARCH\""
+      echo ""
+
+      DETECTED_LEVEL=$(arch_level "$DETECTED_ARCH")
+      CURRENT_LEVEL=$(arch_level "$CURRENT_ARCH")
+
+      if [[ "$DETECTED_LEVEL" -gt "$CURRENT_LEVEL" ]]; then
+        echo ">>> RECOMMENDATION: Your hardware supports gcc.arch = \"$DETECTED_ARCH\""
+        echo "    which is higher than the currently configured \"$CURRENT_ARCH\"."
+        echo ""
+        echo "    To optimize, edit lib/systems/examples.nix:"
+        echo "      gcc.arch = \"$DETECTED_ARCH\";"
+        echo ""
+        echo "    This enables: $HW_FEATURES"
+        if [[ "$DETECTED_LEVEL" -ge 7 ]] && [[ "$CURRENT_LEVEL" -lt 7 ]]; then
+          echo ""
+          echo "    NOTE: z15+ enables DFLTCC (hardware deflate) for zlib/gzip."
+          echo "          10-50x faster compression with -march=z15."
+        fi
+      elif [[ "$DETECTED_LEVEL" -eq "$CURRENT_LEVEL" ]]; then
+        echo "OK: gcc.arch = \"$CURRENT_ARCH\" matches your hardware."
+      else
+        echo "NOTE: gcc.arch = \"$CURRENT_ARCH\" targets newer hardware than detected."
+        echo "      Binaries may not run correctly on this machine."
+      fi
+REMOTE_SCRIPT
+    '';
+  });
+
+  tune-ubuntu = mkApp (import ./z-tuning { inherit pkgs; });
+
   fix-permissions = mkApp (pkgs.writeShellApplication {
     name = "nix-on-z-fix-permissions";
     runtimeInputs = [ pkgs.openssh ];

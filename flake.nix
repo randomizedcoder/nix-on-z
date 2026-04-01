@@ -8,17 +8,17 @@
       system = "x86_64-linux";
 
       # Cross-compilation pkgs with s390x hardware optimization.
-      # gcc.arch = "z13" enables vector extensions (SIMD) and sets the
-      # minimum architecture level. z13 (2015) is the oldest IBM Z still
-      # in production. This fixes cross-assembler failures (e.g., OpenSSL
-      # s390x assembly uses z10+ instructions like cijne) and enables
-      # hardware-accelerated CRC32 in zlib.
+      # gcc.arch = "z15" targets LinuxONE Community Cloud hardware (machine
+      # type 8561). Enables DFLTCC (hardware deflate), VXE3, enhanced sort.
+      # Fixes assembler failures (e.g., OpenSSL s390x assembly uses z10+
+      # instructions like CIJNE) and enables hardware-accelerated CRC32/SIMD.
+      # Run `nix run .#check-arch` to verify against your actual hardware.
       pkgsCross = import nixpkgs {
         inherit system;
         crossSystem = {
           config = "s390x-unknown-linux-gnu";
           gcc = {
-            arch = "z13";
+            arch = "z15";
           };
         };
         overlays = [ (import ./nix/s390x-overlay.nix) ];
