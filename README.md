@@ -86,10 +86,16 @@ Details: [docs/patches.md](docs/patches.md)
 nix build .#nix-s390x
 file result/bin/nix  # ELF 64-bit MSB executable, IBM S/390
 
-# Or: prepare source + sync to z for native build
-nix run .#sync            # rsync patched source + generated scripts to z
-nix run .#build-remote    # build on z via ssh
-nix run .#test-remote     # run tests on z
+# Or: bootstrap nix on a fresh z machine from scratch
+Z_HOST=z2 nix run .#sync            # rsync patched source + scripts to z
+Z_HOST=z2 nix run .#tune-ubuntu     # disable bloat services, sysctl, swap, THP
+Z_HOST=z2 nix run .#build-remote    # build nix + all deps from source on z
+Z_HOST=z2 nix run .#test-remote     # run full test suite on z
+Z_HOST=z2 nix run .#setup-nix       # configure nix.conf, system-features, store
+
+# Then build nixpkgs packages natively on z
+Z_HOST=z2 nix run .#sync-nixpkgs    # rsync patched nixpkgs to z
+Z_HOST=z2 nix run .#check-arch      # verify gcc.arch matches hardware
 
 # Dev shell with tools
 nix develop

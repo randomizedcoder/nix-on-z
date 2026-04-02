@@ -30,6 +30,12 @@ in
     text = ''
       Z_HOST="''${Z_HOST:-z}"
       echo "Syncing patched nix source to $Z_HOST..."
+
+      # Ensure target directories exist and are writable.
+      # Nix store paths are read-only, so rsync copies inherit that — we must
+      # chmod after sync or subsequent syncs/builds fail with permission denied.
+      ssh "$Z_HOST" 'mkdir -p ~/nix ~/rapidcheck ~/nix-on-z/patches && chmod -R u+w ~/nix ~/rapidcheck ~/nix-on-z 2>/dev/null || true'
+
       rsync -avz --delete \
         --exclude='/build/' --exclude='/builddir/' \
         "${bundle}/nix-source/" "$Z_HOST:nix/"
@@ -38,6 +44,10 @@ in
         "${bundle}/rapidcheck-source/" "$Z_HOST:rapidcheck/"
       rsync -avz "${bundle}/scripts/" "$Z_HOST:nix-on-z/"
       rsync -avz "${bundle}/patches/" "$Z_HOST:nix-on-z/patches/"
+
+      # Make synced files writable so builds can modify the source tree
+      ssh "$Z_HOST" 'chmod -R u+w ~/nix ~/rapidcheck ~/nix-on-z'
+
       echo "Sync complete. ssh $Z_HOST and run scripts in ~/nix-on-z/"
     '';
   });
@@ -48,7 +58,9 @@ in
     text = ''
       Z_HOST="''${Z_HOST:-z}"
       echo "Running build on $Z_HOST..."
-      ssh "$Z_HOST" 'cd ~/nix-on-z && ${mkRunCmd zScripts.buildOrder}'
+      # Use sudo --preserve-env=HOME so scripts resolve ~/nix correctly.
+      # Without this, sudo sets HOME=/root and scripts can't find the source.
+      ssh "$Z_HOST" 'cd ~/nix-on-z && for s in ${builtins.concatStringsSep " " (map (n: "${n}.sh") zScripts.buildOrder)}; do echo "=== $s ==="; sudo --preserve-env=HOME bash "$s" || exit 1; done'
       echo "Build complete."
     '';
   });
@@ -59,7 +71,7 @@ in
     text = ''
       Z_HOST="''${Z_HOST:-z}"
       echo "Running tests on $Z_HOST..."
-      ssh "$Z_HOST" 'cd ~/nix-on-z && ${mkRunCmd zScripts.testOrder}'
+      ssh "$Z_HOST" 'cd ~/nix-on-z && for s in ${builtins.concatStringsSep " " (map (n: "${n}.sh") zScripts.testOrder)}; do echo "=== $s ==="; sudo --preserve-env=HOME bash "$s" || exit 1; done'
       echo "Tests complete."
     '';
   });
@@ -163,6 +175,78 @@ REMOTE_SCRIPT
       # builds and tests can modify the source tree.
       ssh "$Z_HOST" "sudo chown -R $REMOTE_USER:$REMOTE_USER ~/nix && chmod -R u+w ~/nix"
       echo "Permissions fixed."
+    '';
+  });
+
+  # Sync our patched nixpkgs to z for native s390x builds (e.g. ClickHouse).
+  # This is separate from the nix source sync — nixpkgs is ~2GB and lives in
+  # ~/nixpkgs on z, not ~/nix.
+  sync-nixpkgs = mkApp (pkgs.writeShellApplication {
+    name = "nix-on-z-sync-nixpkgs";
+    runtimeInputs = [ pkgs.rsync pkgs.openssh ];
+    text = ''
+      Z_HOST="''${Z_HOST:-z}"
+      NIXPKGS_SRC="''${NIXPKGS_SRC:-$HOME/Downloads/z/nixpkgs}"
+
+      if [[ ! -d "$NIXPKGS_SRC" ]]; then
+        echo "ERROR: nixpkgs source not found at $NIXPKGS_SRC"
+        echo "Set NIXPKGS_SRC to your patched nixpkgs checkout"
+        exit 1
+      fi
+
+      echo "Syncing nixpkgs to $Z_HOST..."
+      # Do NOT exclude .git — nix needs it for source tracking and version detection
+      rsync -avz --delete \
+        --exclude='/result' --exclude='/result-*' \
+        "$NIXPKGS_SRC/" "$Z_HOST:nixpkgs/"
+      echo "Sync complete."
+      echo ""
+      echo "To build ClickHouse on $Z_HOST:"
+      echo "  ssh $Z_HOST"
+      echo "  cd ~/nixpkgs && nix-build -A clickhouse --cores \$(nproc) -j 2"
+    '';
+  });
+
+  # Configure nix on z for s390x builds (system-features, store init).
+  # Run this after nix is installed but before any nix-build.
+  setup-nix = mkApp (pkgs.writeShellApplication {
+    name = "nix-on-z-setup-nix";
+    runtimeInputs = [ pkgs.openssh ];
+    text = ''
+      Z_HOST="''${Z_HOST:-z}"
+      echo "Configuring nix on $Z_HOST for s390x builds..."
+      # shellcheck disable=SC2029
+      ssh "$Z_HOST" 'sudo bash -s' <<'REMOTE_SCRIPT'
+      set -euo pipefail
+
+      # Create nix config directory
+      mkdir -p /etc/nix
+
+      # Set system-features to match gcc.arch=z15 in platforms.nix.
+      # Without this, all derivations fail with "missing system features: gccarch-z15"
+      cat > /etc/nix/nix.conf <<'NIXCONF'
+      system-features = benchmark big-parallel gccarch-z15 nixos-test uid-range
+      sandbox = false
+      max-jobs = auto
+      cores = 0
+NIXCONF
+
+      # Initialize single-user nix store if not present
+      REMOTE_USER=$(logname 2>/dev/null || echo linux1)
+      STORE_ROOT="/home/$REMOTE_USER/.local/share/nix/root"
+      if [[ ! -d "$STORE_ROOT/nix/store" ]]; then
+        echo "  Initializing nix store at $STORE_ROOT..."
+        mkdir -p "$STORE_ROOT/nix/store"
+        mkdir -p "$STORE_ROOT/nix/var/nix/db"
+        chown -R "$REMOTE_USER:$REMOTE_USER" "$STORE_ROOT"
+      else
+        echo "  Nix store already exists at $STORE_ROOT"
+      fi
+
+      echo "  nix.conf written to /etc/nix/nix.conf"
+      echo "  system-features: benchmark big-parallel gccarch-z15 nixos-test uid-range"
+      echo "Done."
+REMOTE_SCRIPT
     '';
   });
 }

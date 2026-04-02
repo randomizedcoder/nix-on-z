@@ -83,7 +83,8 @@ let
             m4 \
             gettext \
             lowdown \
-            bash-static
+            bash-static \
+            btop
 
         echo "Phase 0 complete: apt dependencies installed."
       '';
@@ -125,7 +126,7 @@ let
         SRC_DIR="''${BUILD_DIR}/gcc-''${GCC_VERSION}"
         OBJ_DIR="''${BUILD_DIR}/objdir"
         PREFIX="/usr/local"
-        JOBS=1  # z machine has only 3.9 GiB RAM; >1 job OOMs during linking
+        JOBS="$(nproc)"  # use all cores; z2 has 16GB RAM, plenty for parallel GCC builds
 
         # Skip if correct version is already installed
         if "''${PREFIX}/bin/gcc" --version 2>/dev/null | head -n 1 | grep -q "''${GCC_VERSION}"; then
@@ -207,7 +208,7 @@ let
         BOOST_URL="${v.url}"
         BUILD_DIR="''${HOME}/boost-build"
         PREFIX="/usr/local"
-        JOBS=1  # z machine has only 3.9 GiB RAM; >1 job OOMs during linking
+        JOBS="$(nproc)"  # use all cores; z2 has 16GB RAM, plenty for parallel boost builds
 
         export CC=/usr/local/bin/gcc
         export CXX=/usr/local/bin/g++
