@@ -1,14 +1,15 @@
 # Swap file for memory-constrained Z VMs.
 # LLVM/Clang linking needs 7+ GB (libclang-cpp.so link step was OOM-killed
-# with 4GB swap). 8GB swap + 4GB RAM = 12GB total — enough headroom.
+# with 4GB swap). 16GB swap + 16GB RAM = 32GB total — comfortable headroom
+# for ClickHouse and simultaneous large builds.
 # Swap on z is less painful than x86 thanks to channel-based I/O, hardware
 # page management, and CMMA. See docs/technical-reference.md for details.
 {
   name = "swap";
-  description = "Create 8GB swap file for linking large binaries (LLVM/Clang)";
+  description = "Create 16GB swap file for linking large binaries (LLVM/Clang)";
   script = ''
     echo "--- Configuring swap ---"
-    SWAP_SIZE="8G"
+    SWAP_SIZE="16G"
     if swapon --show | grep -q /swapfile; then
       echo "  swap already active"
     elif [ -f /swapfile ]; then

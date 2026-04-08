@@ -1,10 +1,13 @@
 # Deployment apps as writeShellApplication (gets shellcheck for free).
 #
-# sync            — rsync patched source bundle to z
-# build-remote    — SSH to z and run build scripts
-# test-remote     — SSH to z and run test suite
-# verify-remote   — SSH to z and run environment verification
-# fix-permissions — SSH to z and fix source tree permissions after meson install
+# sync                  — rsync patched source bundle to z
+# build-remote          — SSH to z and run build scripts
+# test-remote           — SSH to z and run test suite
+# verify-remote         — SSH to z and run environment verification
+# fix-permissions       — SSH to z and fix source tree permissions after meson install
+# build-clickhouse      — build ClickHouse natively on z from synced nixpkgs
+# sync-clickhouse-tests — sparse-clone ClickHouse test suite to z
+# test-clickhouse       — run ClickHouse functional tests on z
 { pkgs, self, zScripts }:
 
 let
@@ -61,6 +64,9 @@ in
       # Use sudo --preserve-env=HOME so scripts resolve ~/nix correctly.
       # Without this, sudo sets HOME=/root and scripts can't find the source.
       ssh "$Z_HOST" 'cd ~/nix-on-z && for s in ${builtins.concatStringsSep " " (map (n: "${n}.sh") zScripts.buildOrder)}; do echo "=== $s ==="; sudo --preserve-env=HOME bash "$s" || exit 1; done'
+      # Fix /nix ownership after sudo build — single-user nix needs the
+      # build user to own /nix, but sudo leaves it owned by root.
+      ssh "$Z_HOST" 'sudo chown -R $(whoami):$(whoami) /nix'
       echo "Build complete."
     '';
   });
@@ -243,9 +249,255 @@ NIXCONF
         echo "  Nix store already exists at $STORE_ROOT"
       fi
 
+      # Fix /nix ownership — build-remote installs nix as root via sudo,
+      # leaving /nix owned by root. Single-user nix needs it owned by the
+      # build user so nix-build can write to the store.
+      if [[ -d /nix ]]; then
+        echo "  Fixing /nix ownership to $REMOTE_USER..."
+        chown -R "$REMOTE_USER:$REMOTE_USER" /nix
+      fi
+
       echo "  nix.conf written to /etc/nix/nix.conf"
       echo "  system-features: benchmark big-parallel gccarch-z15 nixos-test uid-range"
       echo "Done."
+REMOTE_SCRIPT
+    '';
+  });
+
+  # Verify nix is working before attempting nix-build.
+  # Checks: binary exists, version, store is writable, system-features match,
+  # and a trivial derivation builds successfully.
+  verify-nix = mkApp (pkgs.writeShellApplication {
+    name = "nix-on-z-verify-nix";
+    runtimeInputs = [ pkgs.openssh ];
+    text = ''
+      Z_HOST="''${Z_HOST:-z}"
+      echo "Verifying nix on $Z_HOST..."
+      # shellcheck disable=SC2029
+      ssh "$Z_HOST" 'bash -s' <<'REMOTE_SCRIPT'
+      set -euo pipefail
+      PASS=0
+      FAIL=0
+
+      check() {
+        if eval "$2" > /dev/null 2>&1; then
+          echo "  PASS: $1"
+          PASS=$((PASS + 1))
+        else
+          echo "  FAIL: $1"
+          FAIL=$((FAIL + 1))
+        fi
+      }
+
+      echo "=== Nix Installation ==="
+      check "nix binary exists" "command -v nix"
+      check "nix --version runs" "nix --version"
+      echo "  $(nix --version 2>/dev/null || echo 'not installed')"
+
+      echo ""
+      echo "=== Store Permissions ==="
+      check "/nix/store exists" "test -d /nix/store"
+      check "/nix/store is writable" "touch /nix/store/.write-test && rm /nix/store/.write-test"
+      STORE_OWNER=$(stat -c '%U' /nix/store 2>/dev/null || echo 'unknown')
+      echo "  /nix/store owner: $STORE_OWNER"
+
+      echo ""
+      echo "=== Configuration ==="
+      check "nix.conf exists" "test -f /etc/nix/nix.conf"
+      if [ -f /etc/nix/nix.conf ]; then
+        FEATURES=$(grep 'system-features' /etc/nix/nix.conf 2>/dev/null || echo 'not set')
+        echo "  $FEATURES"
+        check "gccarch-z15 in system-features" "grep -q gccarch-z15 /etc/nix/nix.conf"
+      fi
+
+      echo ""
+      echo "=== Trivial Build Test ==="
+      check "nix-build trivial derivation" "nix-build -E 'derivation { name = \"test\"; system = \"s390x-linux\"; builder = /bin/sh; args = [\"-c\" \"echo ok > \\\$out\"]; }' --no-out-link"
+
+      echo ""
+      echo "=== Result: $PASS passed, $FAIL failed ==="
+      if [ "$FAIL" -gt 0 ]; then
+        echo "Fix issues before running nix-build."
+        exit 1
+      else
+        echo "Nix is ready for building."
+      fi
+REMOTE_SCRIPT
+    '';
+  });
+
+  # Build ClickHouse natively on z from the synced nixpkgs.
+  build-clickhouse = mkApp (pkgs.writeShellApplication {
+    name = "nix-on-z-build-clickhouse";
+    runtimeInputs = [ pkgs.openssh ];
+    text = ''
+      Z_HOST="''${Z_HOST:-z}"
+      CORES="''${CORES:-4}"
+      JOBS="''${JOBS:-2}"
+      echo "Building ClickHouse on $Z_HOST (--cores $CORES -j $JOBS)..."
+      # shellcheck disable=SC2029
+      ssh "$Z_HOST" "cd ~/nixpkgs && nix-build -A clickhouse --cores $CORES -j $JOBS 2>&1 | tee ~/clickhouse-build.log"
+      echo ""
+      echo "Verifying build..."
+      # shellcheck disable=SC2029
+      ssh "$Z_HOST" 'file ~/nixpkgs/result/bin/clickhouse && ~/nixpkgs/result/bin/clickhouse local --version && ~/nixpkgs/result/bin/clickhouse local --query "SELECT 1"'
+      echo "ClickHouse build complete."
+    '';
+  });
+
+  # Clone ClickHouse test suite to z (sparse checkout — tests/ directory only).
+  sync-clickhouse-tests = mkApp (pkgs.writeShellApplication {
+    name = "nix-on-z-sync-clickhouse-tests";
+    runtimeInputs = [ pkgs.openssh ];
+    text = ''
+      Z_HOST="''${Z_HOST:-z}"
+      CH_VERSION="v26.2.4.23-stable"
+      echo "Syncing ClickHouse test suite ($CH_VERSION) to $Z_HOST..."
+      # shellcheck disable=SC2029
+      ssh "$Z_HOST" "bash -s -- $CH_VERSION" <<'REMOTE_SCRIPT'
+      set -euo pipefail
+      CH_VERSION="$1"
+      TEST_DIR=~/clickhouse-tests
+      if [[ -d "$TEST_DIR/tests" ]]; then
+        echo "  Tests already present at $TEST_DIR/tests"
+        echo "  To re-clone, remove $TEST_DIR first"
+        ls "$TEST_DIR/tests/" | head -10
+      else
+        echo "  Sparse-cloning ClickHouse repo (tests/ only)..."
+        rm -rf "$TEST_DIR"
+        git clone --depth 1 --branch "$CH_VERSION" --filter=blob:none --sparse \
+          https://github.com/ClickHouse/ClickHouse.git "$TEST_DIR"
+        cd "$TEST_DIR"
+        git sparse-checkout set tests/
+        echo "  Clone complete."
+        ls tests/
+      fi
+REMOTE_SCRIPT
+    '';
+  });
+
+  # Run ClickHouse test suite on z.
+  # Sets up a temporary server, runs clickhouse-test, reports results.
+  test-clickhouse = mkApp (pkgs.writeShellApplication {
+    name = "nix-on-z-test-clickhouse";
+    runtimeInputs = [ pkgs.openssh ];
+    text = ''
+      Z_HOST="''${Z_HOST:-z}"
+      echo "Running ClickHouse tests on $Z_HOST..."
+      # shellcheck disable=SC2029
+      ssh "$Z_HOST" 'bash -s' <<'REMOTE_SCRIPT'
+      set -euo pipefail
+
+      CH=~/nixpkgs/result/bin/clickhouse
+      TEST_DIR=~/clickhouse-tests
+      DATA_DIR=/tmp/ch-test-server
+
+      if [[ ! -x "$CH" ]]; then
+        echo "ERROR: ClickHouse binary not found at $CH"
+        echo "Run 'nix run .#build-clickhouse' first."
+        exit 1
+      fi
+
+      if [[ ! -d "$TEST_DIR/tests" ]]; then
+        echo "ERROR: Test suite not found at $TEST_DIR/tests"
+        echo "Run 'nix run .#sync-clickhouse-tests' first."
+        exit 1
+      fi
+
+      # Clean up any previous test server
+      pkill -f "clickhouse server.*ch-test-server" 2>/dev/null || true
+      sleep 1
+      rm -rf "$DATA_DIR"
+      mkdir -p "$DATA_DIR"/{data,tmp,user_files,format_schemas,log}
+
+      # Write minimal server config
+      cat > "$DATA_DIR/config.xml" <<'XMLEOF'
+<?xml version="1.0"?>
+<clickhouse>
+    <path>/tmp/ch-test-server/data/</path>
+    <tmp_path>/tmp/ch-test-server/tmp/</tmp_path>
+    <user_files_path>/tmp/ch-test-server/user_files/</user_files_path>
+    <format_schema_path>/tmp/ch-test-server/format_schemas/</format_schema_path>
+    <logger>
+        <log>/tmp/ch-test-server/log/clickhouse-server.log</log>
+        <errorlog>/tmp/ch-test-server/log/clickhouse-server.err.log</errorlog>
+        <level>warning</level>
+    </logger>
+    <tcp_port>9000</tcp_port>
+    <http_port>8123</http_port>
+    <listen_host>127.0.0.1</listen_host>
+    <mark_cache_size>5368709120</mark_cache_size>
+    <max_concurrent_queries>100</max_concurrent_queries>
+    <users_config>/tmp/ch-test-server/users.xml</users_config>
+</clickhouse>
+XMLEOF
+
+      cat > "$DATA_DIR/users.xml" <<'XMLEOF'
+<?xml version="1.0"?>
+<clickhouse>
+    <profiles>
+        <default/>
+    </profiles>
+    <users>
+        <default>
+            <password></password>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <access_management>1</access_management>
+        </default>
+    </users>
+    <quotas>
+        <default/>
+    </quotas>
+</clickhouse>
+XMLEOF
+
+      echo "Starting ClickHouse test server..."
+      "$CH" server --config-file "$DATA_DIR/config.xml" &
+      SERVER_PID=$!
+      sleep 5
+
+      if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "ERROR: Server failed to start. Log:"
+        tail -20 "$DATA_DIR/log/clickhouse-server.log"
+        exit 1
+      fi
+
+      echo "Server running (PID $SERVER_PID). Running tests..."
+      echo ""
+
+      # Run the stateless functional tests (the main test suite)
+      cd "$TEST_DIR"
+      RESULT=0
+      if [[ -x tests/clickhouse-test ]]; then
+        python3 tests/clickhouse-test \
+          --binary "$CH" \
+          --queries tests/queries \
+          --tmp "$DATA_DIR/tmp" \
+          2>&1 | tee ~/clickhouse-test-results.log || RESULT=$?
+      else
+        echo "clickhouse-test runner not executable, trying direct invocation..."
+        python3 tests/clickhouse-test \
+          --binary "$CH" \
+          --queries tests/queries \
+          --tmp "$DATA_DIR/tmp" \
+          2>&1 | tee ~/clickhouse-test-results.log || RESULT=$?
+      fi
+
+      echo ""
+      echo "=== Test Results ==="
+      tail -20 ~/clickhouse-test-results.log
+      echo ""
+
+      # Cleanup
+      echo "Stopping test server..."
+      kill "$SERVER_PID" 2>/dev/null || true
+      wait "$SERVER_PID" 2>/dev/null || true
+      echo "Done. Full results in ~/clickhouse-test-results.log"
+      exit $RESULT
 REMOTE_SCRIPT
     '';
   });
