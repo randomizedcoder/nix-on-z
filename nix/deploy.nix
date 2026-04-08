@@ -376,6 +376,25 @@ REMOTE_SCRIPT
     '';
   });
 
+  # Build minio (S3-compatible object store) on z for ClickHouse S3 tests.
+  build-minio = mkApp (pkgs.writeShellApplication {
+    name = "nix-on-z-build-minio";
+    runtimeInputs = [ pkgs.openssh ];
+    text = ''
+      Z_HOST="''${Z_HOST:-z}"
+      CORES="''${CORES:-4}"
+      JOBS="''${JOBS:-2}"
+      echo "Building minio on $Z_HOST (--cores $CORES -j $JOBS)..."
+      # shellcheck disable=SC2029
+      ssh "$Z_HOST" "cd ~/nixpkgs && nix-build -A minio -o ~/minio-result --cores $CORES -j $JOBS 2>&1 | tee ~/minio-build.log"
+      echo ""
+      echo "Verifying build..."
+      # shellcheck disable=SC2029
+      ssh "$Z_HOST" 'file ~/minio-result/bin/minio && ~/minio-result/bin/minio --version'
+      echo "Minio build complete. Symlink at ~/minio-result"
+    '';
+  });
+
   # Run ClickHouse test suite on z.
   # Sets up a temporary server, runs clickhouse-test, reports results.
   test-clickhouse = mkApp (pkgs.writeShellApplication {
@@ -404,13 +423,20 @@ REMOTE_SCRIPT
         exit 1
       fi
 
-      # Clean up any previous test server
+      # Clean up any previous test server and minio
       pkill -f "clickhouse server.*ch-test-server" 2>/dev/null || true
+      pkill -f "minio server" 2>/dev/null || true
       sleep 1
       rm -rf "$DATA_DIR"
-      mkdir -p "$DATA_DIR"/{data,tmp,user_files,format_schemas,log}
+      mkdir -p "$DATA_DIR"/{data,tmp,user_files,format_schemas,log,access,minio-data}
 
-      # Write minimal server config
+      # Ensure jq is available (needed by some tests)
+      if ! command -v jq &>/dev/null; then
+        echo "Installing jq..."
+        sudo apt-get install -y jq
+      fi
+
+      # Write server config with query_log, clusters, and RBAC support
       cat > "$DATA_DIR/config.xml" <<'XMLEOF'
 <?xml version="1.0"?>
 <clickhouse>
@@ -418,17 +444,130 @@ REMOTE_SCRIPT
     <tmp_path>/tmp/ch-test-server/tmp/</tmp_path>
     <user_files_path>/tmp/ch-test-server/user_files/</user_files_path>
     <format_schema_path>/tmp/ch-test-server/format_schemas/</format_schema_path>
+    <access_control_path>/tmp/ch-test-server/access/</access_control_path>
     <logger>
         <log>/tmp/ch-test-server/log/clickhouse-server.log</log>
         <errorlog>/tmp/ch-test-server/log/clickhouse-server.err.log</errorlog>
-        <level>warning</level>
+        <level>information</level>
     </logger>
     <tcp_port>9000</tcp_port>
     <http_port>8123</http_port>
+    <interserver_http_port>9009</interserver_http_port>
     <listen_host>127.0.0.1</listen_host>
+    <listen_host>127.0.0.2</listen_host>
     <mark_cache_size>5368709120</mark_cache_size>
-    <max_concurrent_queries>100</max_concurrent_queries>
-    <users_config>/tmp/ch-test-server/users.xml</users_config>
+    <max_concurrent_queries>500</max_concurrent_queries>
+
+    <query_log>
+        <database>system</database>
+        <table>query_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    </query_log>
+    <query_thread_log>
+        <database>system</database>
+        <table>query_thread_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    </query_thread_log>
+    <part_log>
+        <database>system</database>
+        <table>part_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    </part_log>
+    <metric_log>
+        <database>system</database>
+        <table>metric_log</table>
+        <collect_interval_milliseconds>1000</collect_interval_milliseconds>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    </metric_log>
+
+    <remote_servers>
+        <parallel_replicas>
+            <shard>
+                <internal_replication>false</internal_replication>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </parallel_replicas>
+        <test_shard_localhost>
+            <shard>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </test_shard_localhost>
+        <test_cluster_one_shard_three_replicas_localhost>
+            <shard>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </test_cluster_one_shard_three_replicas_localhost>
+        <test_cluster_two_shards_localhost>
+            <shard>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </test_cluster_two_shards_localhost>
+    </remote_servers>
+
+    <user_directories>
+        <users_xml>
+            <path>/tmp/ch-test-server/users.xml</path>
+        </users_xml>
+        <local_directory>
+            <path>/tmp/ch-test-server/access/</path>
+        </local_directory>
+    </user_directories>
+
+    <storage_configuration>
+        <disks>
+            <s3_disk>
+                <type>s3</type>
+                <endpoint>http://127.0.0.1:9001/clickhouse-test/s3_disk/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+            </s3_disk>
+            <s3_plain_rewritable>
+                <type>s3_plain_rewritable</type>
+                <endpoint>http://127.0.0.1:9001/clickhouse-test/s3_plain/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+            </s3_plain_rewritable>
+        </disks>
+    </storage_configuration>
+
+    <named_collections>
+        <s3_conn>
+            <url>http://127.0.0.1:9001/clickhouse-test/</url>
+            <access_key_id>clickhouse</access_key_id>
+            <secret_access_key>clickhouse</secret_access_key>
+        </s3_conn>
+    </named_collections>
+
+    <backups>
+        <allowed_disk>s3_disk</allowed_disk>
+        <allowed_disk>s3_plain_rewritable</allowed_disk>
+    </backups>
 </clickhouse>
 XMLEOF
 
@@ -455,7 +594,43 @@ XMLEOF
 </clickhouse>
 XMLEOF
 
+      # Start minio (S3-compatible storage) if available
+      MINIO_BIN=""
+      if [[ -x ~/minio-result/bin/minio ]]; then
+        MINIO_BIN=~/minio-result/bin/minio
+      fi
+      MINIO_PID=""
+      if [[ -n "$MINIO_BIN" && -x "$MINIO_BIN" ]]; then
+        echo "Starting minio S3 server..."
+        export MINIO_ROOT_USER=clickhouse
+        export MINIO_ROOT_PASSWORD=clickhouse
+        "$MINIO_BIN" server "$DATA_DIR/minio-data" \
+          --address 127.0.0.1:9001 \
+          --console-address 127.0.0.1:9002 \
+          > "$DATA_DIR/log/minio.log" 2>&1 &
+        MINIO_PID=$!
+        sleep 2
+        if kill -0 "$MINIO_PID" 2>/dev/null; then
+          echo "Minio running (PID $MINIO_PID) on http://127.0.0.1:9001"
+          # Create the test bucket
+          if command -v mc &>/dev/null; then
+            mc alias set local http://127.0.0.1:9001 clickhouse clickhouse 2>/dev/null || true
+            mc mb local/clickhouse-test 2>/dev/null || true
+          else
+            # Use curl to create bucket via S3 API
+            curl -s -X PUT http://127.0.0.1:9001/clickhouse-test \
+              -u clickhouse:clickhouse 2>/dev/null || true
+          fi
+        else
+          echo "WARNING: Minio failed to start, S3 tests will be skipped"
+          MINIO_PID=""
+        fi
+      else
+        echo "Minio not built — S3 tests will be skipped. Run 'nix run .#build-minio' first."
+      fi
+
       echo "Starting ClickHouse test server..."
+      export MALLOC_CONF="background_thread:true,prof:true"
       "$CH" server --config-file "$DATA_DIR/config.xml" &
       SERVER_PID=$!
       sleep 5
@@ -472,20 +647,12 @@ XMLEOF
       # Run the stateless functional tests (the main test suite)
       cd "$TEST_DIR"
       RESULT=0
-      if [[ -x tests/clickhouse-test ]]; then
-        python3 tests/clickhouse-test \
+      python3 tests/clickhouse-test \
           --binary "$CH" \
           --queries tests/queries \
           --tmp "$DATA_DIR/tmp" \
+          -j 2 \
           2>&1 | tee ~/clickhouse-test-results.log || RESULT=$?
-      else
-        echo "clickhouse-test runner not executable, trying direct invocation..."
-        python3 tests/clickhouse-test \
-          --binary "$CH" \
-          --queries tests/queries \
-          --tmp "$DATA_DIR/tmp" \
-          2>&1 | tee ~/clickhouse-test-results.log || RESULT=$?
-      fi
 
       echo ""
       echo "=== Test Results ==="
@@ -496,6 +663,11 @@ XMLEOF
       echo "Stopping test server..."
       kill "$SERVER_PID" 2>/dev/null || true
       wait "$SERVER_PID" 2>/dev/null || true
+      if [[ -n "$MINIO_PID" ]]; then
+        echo "Stopping minio..."
+        kill "$MINIO_PID" 2>/dev/null || true
+        wait "$MINIO_PID" 2>/dev/null || true
+      fi
       echo "Done. Full results in ~/clickhouse-test-results.log"
       exit $RESULT
 REMOTE_SCRIPT
