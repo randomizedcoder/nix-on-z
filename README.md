@@ -28,6 +28,7 @@ missing dependencies from source, then configure, build, and install Nix itself.
 | [S390X Porting Guide](S390X-PORTING-GUIDE.md) | Master guide for porting nixpkgs packages to s390x |
 | [Priority Plan](docs/priority-plan.md) | Dependency-graph-ranked porting priorities |
 | [ClickHouse Case Study](docs/example-clickhouse.md) | End-to-end porting example |
+| [ClickHouse Test Results](docs/clickhouse-test-results.md) | s390x test suite results, failure categories, investigation status |
 | [Technical Reference](docs/technical-reference.md) | s390x architecture reference (replaces s390x-analysis.md) |
 | [Package Cross-Reference](docs/package-crossref.md) | 353 linux-on-ibm-z repos mapped to nixpkgs |
 | [IBM Z Patch Reuse](docs/ibm-z-patch-reuse.md) | Prioritized strategy for reusing linux-on-ibm-z patches |
@@ -86,10 +87,16 @@ Details: [docs/patches.md](docs/patches.md)
 nix build .#nix-s390x
 file result/bin/nix  # ELF 64-bit MSB executable, IBM S/390
 
-# Or: prepare source + sync to z for native build
-nix run .#sync            # rsync patched source + generated scripts to z
-nix run .#build-remote    # build on z via ssh
-nix run .#test-remote     # run tests on z
+# Or: bootstrap nix on a fresh z machine from scratch
+Z_HOST=z2 nix run .#sync            # rsync patched source + scripts to z
+Z_HOST=z2 nix run .#tune-ubuntu     # disable bloat services, sysctl, swap, THP
+Z_HOST=z2 nix run .#build-remote    # build nix + all deps from source on z
+Z_HOST=z2 nix run .#test-remote     # run full test suite on z
+Z_HOST=z2 nix run .#setup-nix       # configure nix.conf, system-features, store
+
+# Then build nixpkgs packages natively on z
+Z_HOST=z2 nix run .#sync-nixpkgs    # rsync patched nixpkgs to z
+Z_HOST=z2 nix run .#check-arch      # verify gcc.arch matches hardware
 
 # Dev shell with tools
 nix develop
@@ -113,13 +120,35 @@ Or clone and build manually on z -- see [docs/build-guide.md](docs/build-guide.m
 
 ## Target Environment
 
-| | |
-|---|---|
-| **Architecture** | s390x (IBM z16 / LinuxONE) |
-| **OS** | Ubuntu 22.04 LTS |
-| **RAM** | 3.9 GiB (scripts use `-j1` where needed to avoid OOM) |
-| **Disk** | ~45 GB free recommended |
-| **Nix version** | 2.35.0 (built from source) |
+All machines are provided by the [LinuxONE Community Cloud](https://developer.ibm.com/articles/get-started-with-ibm-linuxone/).
+
+| | **z** (original) | **z2** (current) |
+|---|---|---|
+| **Role** | Initial bootstrap & testing | Primary build server |
+| **Machine type** | 8561 (z15) | 8561 (z15) |
+| **vCPUs** | 2 | 4 |
+| **RAM** | 3.9 GiB | 15 GiB |
+| **Disk** | 50 GB | 99 GB |
+| **OS** | Ubuntu 22.04.5 LTS | Ubuntu 22.04.1 LTS |
+| **Clock** | 5.2 GHz | 5.2 GHz |
+| **L1 cache** | 128KB I + 128KB D / core | 128KB I + 128KB D / core |
+| **L2 cache** | 4MB / core | 4MB / core |
+| **L3 cache** | 256MB shared | 256MB shared |
+| **L4 cache** | 960MB shared | 960MB shared |
+| **Nix version** | 2.35.0 (built from source) | 2.35.0 (building) |
+| **SSH alias** | `z` | `z2` |
+
+**Why z2?** The original z machine (2 vCPU, 4GB RAM, 50GB disk) is too small
+for bootstrapping LLVM/Clang from source — the `libclang-cpp.so` link step
+needs 7+ GB RAM, and the nix store + build artifacts exceed 50GB. z2 has 4x
+the RAM, 2x the cores, and 2x the disk — enough for a full nixpkgs bootstrap.
+
+All deploy scripts support `Z_HOST=z2` to target the new machine:
+```bash
+Z_HOST=z2 nix run .#sync           # sync source to z2
+Z_HOST=z2 nix run .#build-remote   # build nix on z2
+Z_HOST=z2 nix run .#tune-ubuntu    # apply OS tuning to z2
+```
 
 ## License
 

@@ -1,0 +1,27 @@
+--- a/flake.nix
++++ b/flake.nix
+@@ -46,10 +46,22 @@
+       ];
+       systems = linuxSystems ++ darwinSystems;
+
+-      crossSystems = [
++      # Tier 1 cross targets: ARM and RISC-V (already present)
++      crossSystemsArm = [
+         "armv6l-unknown-linux-gnueabihf"
+         "armv7l-unknown-linux-gnueabihf"
+         "riscv64-unknown-linux-gnu"
++      ];
++
++      # Tier 2 cross targets: enterprise, HPC, and emerging architectures
++      crossSystemsExtended = [
++        "s390x-unknown-linux-gnu"        # IBM Z / LinuxONE (enterprise)
++        "powerpc64le-unknown-linux-gnu"   # IBM POWER (HPC, AI, OpenPOWER)
++        "powerpc64-unknown-linux-gnu"     # POWER big-endian (Talos II)
++        "loongarch64-unknown-linux-gnu"   # LoongArch (emerging Chinese arch)
++        "riscv32-unknown-linux-gnu"       # RISC-V 32-bit (embedded/IoT)
++      ];
++
++      crossSystems = crossSystemsArm ++ crossSystemsExtended ++ [
+         # Disabled because of https://github.com/NixOS/nixpkgs/issues/344423
+         # "x86_64-unknown-netbsd"
+         "x86_64-unknown-freebsd"

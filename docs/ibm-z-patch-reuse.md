@@ -33,8 +33,14 @@ Patches that enable s390x hardware features (already supported upstream, need ni
 | **PCRE2** | `pcre2` + `sljit` | JIT backend | s390x JIT via SLJIT | 108 dependents; regex performance recovery |
 
 OpenSSL CPACF is already applied in our local nixpkgs. zlib VX CRC32 fix applied
-(`-march=z13` in CFLAGS, following Fedora/Ubuntu patches). zlib DFLTCC (`--dfltcc`
-configure flag) and PCRE2 SLJIT are next.
+(`-march=z13` in CFLAGS, following Fedora/Ubuntu patches). PCRE2 SLJIT JIT re-enabled
+(s390x backend available since PCRE2 10.39 / SLJIT issue #89; nixpkgs has 10.46).
+
+**zlib DFLTCC status**: The `--dfltcc` configure flag exists only in IBM's unmerged
+PR [madler/zlib#410](https://github.com/madler/zlib/pull/410) and in
+[zlib-ng](https://github.com/zlib-ng/zlib-ng). Upstream zlib 1.3.2 does NOT include
+DFLTCC support. Enabling DFLTCC requires either carrying IBM's patch or transitioning
+to zlib-ng (as Fedora has done).
 
 ## Hard Problems with High Value
 
@@ -51,7 +57,7 @@ Packages requiring significant patches from linux-on-ibm-z:
 
 | Package | linux-on-ibm-z repo | Patch type | Notes |
 |---------|---------------------|------------|-------|
-| **RocksDB** | `rocksdb` | Endianness in block format + CRC SIMD | Unblocks CockroachDB |
+| **RocksDB** | `rocksdb` | CMake s390x detection + CRC fallback | Upstream CMakeLists.txt already handles s390x (`-march=z196` with `PORTABLE=1`). PRs [#8962](https://github.com/facebook/rocksdb/pull/8962), [#6168](https://github.com/facebook/rocksdb/pull/6168) closed but fixes landed incrementally. nixpkgs expression works as-is (`-DPORTABLE=1`, `sse42Support=false`). Cross-endian data files not supported. Unblocks CockroachDB |
 | **MongoDB** | `MongoDB` | BSON endianness + WiredTiger asm | Significant work |
 | **CockroachDB** | `cockroach` | Go + C++ (inherits RocksDB issues) | Blocked on RocksDB |
 | **ClickHouse** | N/A (our case study) | SIMD disable, OpenSSL for gRPC, ICU BE | In progress |
