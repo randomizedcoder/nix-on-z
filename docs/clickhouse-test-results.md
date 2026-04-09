@@ -607,6 +607,184 @@ refactor could break it. Worth flagging to upstream.
 
 ---
 
+## s390x Hardware Capabilities and Future Optimization
+
+This section documents s390x hardware features relevant to ClickHouse and
+identifies opportunities for future performance improvements. The current
+priority is correctness (endianness fixes); optimization comes later.
+
+### s390x Register Architecture
+
+| Register Type | Count | Width | Notes |
+|---------------|------:|------:|-------|
+| General-purpose (GPR) | 16 | 64-bit | All arithmetic/addressing |
+| Floating-point (FPR) | 16 | 64-bit | IEEE 754 double; no 80-bit extended (unlike x86) |
+| Vector (VR) | 32 | 128-bit | VX facility (z13+); V0-V15 overlap FPR |
+| Control | 16 | 64-bit | OS-only |
+
+**No 80-bit extended precision**: s390x FPRs implement strict 64-bit IEEE 754.
+x86's 80-bit `long double` intermediate values can cause subtle rounding
+differences. All ClickHouse Float64 tests confirmed bit-exact results on s390x.
+
+### 128-bit Vector Registers (VX/VXE) and SIMD
+
+The z/Architecture Vector Facility provides 32 x 128-bit vector registers:
+
+| Generation | Facility | Key Additions |
+|------------|----------|---------------|
+| z13 (2015) | VX | 128-bit vectors, integer/FP SIMD |
+| z14 (2017) | VXE | Enhanced vectors, IEEE 128-bit float |
+| z15 (2019) | VXE3 | Misc instruction extensions, DFLTCC |
+| z16 (2022) | VXE + NNPA | AI accelerator (neural network) |
+
+Each 128-bit register can be interpreted as: 1x128, 2x64, 4x32, 8x16, or
+16x8 elements. Intrinsics are in `<vecintrin.h>` (completely different API
+from x86's `<immintrin.h>`).
+
+**Critical endianness difference in SIMD**: s390x vector element ordering
+is reversed compared to x86:
+
+```
+x86 SSE (little-endian):   element[0] at lowest address
+s390x VX (big-endian):     element[0] at HIGHEST address
+
+Loading 4x UInt32 {1, 2, 3, 4} from memory:
+  x86:   v[0]=1, v[1]=2, v[2]=3, v[3]=4
+  s390x: v[3]=1, v[2]=2, v[1]=3, v[0]=4  ← reversed!
+
+Extracting "lane 0":
+  x86:   _mm_extract_epi32(v, 0)  → 1 (element at addr+0)
+  s390x: vec_extract(v, 0)        → 4 (element at addr+12, NOT addr+0!)
+```
+
+This means any ClickHouse SIMD code that uses explicit lane indices would
+produce wrong results if naively ported to s390x. All lane-specific operations
+need index remapping.
+
+**Current ClickHouse SIMD status on s390x**: All x86 SIMD is disabled via
+CMake flags (`-DNO_SSE3_OR_HIGHER=1`, `-DNO_AVX_OR_HIGHER=1`, etc.). Query
+processing falls back to scalar C++ code. This is correct but leaves
+performance on the table.
+
+**128-bit integer endianness**: ClickHouse uses UInt128/UInt256 for wide
+integer operations. The file `base/base/wide_integer_impl.h` (lines 302-315)
+handles this correctly with `little(idx)` / `big(idx)` helper methods that
+reverse element indexing on big-endian. This was verified during the
+endianness audit — wide integer operations are safe.
+
+### Hardware CRC32C with Vector Extensions
+
+ClickHouse already has s390x-specific code for CRC32C hashing:
+
+**File**: `base/base/crc32c_s390x.h`
+
+This uses the VX vector extension to compute CRC32C with explicit byte-swapping:
+
+```cpp
+// s390x CRC32C: explicit byte-swap because hardware instruction expects LE
+__builtin_bswap32(crc32c_le_vx(crc, ...))
+```
+
+The hardware `crc32c_le_vx()` instruction operates on little-endian data, so
+s390x code must byte-swap inputs/outputs. This is already correctly implemented
+in ClickHouse.
+
+**Used in**: `src/Common/HashTable/Hash.h` (lines 56-72), string hashing
+
+### DFLTCC: Hardware DEFLATE Compression (z15+)
+
+The z15 introduced DFLTCC (Deflate Conversion Call), a hardware instruction
+that implements RFC 1951 DEFLATE compression in silicon:
+
+- **Throughput**: 10-50x faster than software zlib
+- **Format**: Byte-identical RFC 1951 DEFLATE (cross-platform compatible)
+- **Endianness**: Output is standard DEFLATE format — portable between architectures
+
+**Relevance to ClickHouse**: **Minimal direct impact**. ClickHouse uses LZ4 and
+ZSTD for column compression, not DEFLATE/zlib. However, there are indirect
+opportunities:
+
+| Use Case | Applicability |
+|----------|--------------|
+| Column compression (LZ4/ZSTD) | Not applicable — different algorithms |
+| HTTP compression (gzip) | Could accelerate `Accept-Encoding: gzip` responses |
+| Backup/export compression | Could accelerate `.gz` backup files |
+| zlib-based data import | Could accelerate reading gzip-compressed input files |
+
+To enable DFLTCC, ClickHouse would need to link against zlib-ng (which has
+full DFLTCC support) instead of standard zlib. This is a build system change,
+not a code change.
+
+### SORTL: Hardware Sort Acceleration (z15+)
+
+The z15 introduced the SORTL instruction, a hardware sort accelerator:
+
+- Sorts up to 128 lists of variable-length records
+- Operates on records in memory, returns sorted output
+
+**Relevance to ClickHouse**: Could theoretically accelerate `ORDER BY` and
+`GROUP BY` operations, but requires custom C++ sorting kernels targeting SORTL.
+No ClickHouse integration exists today. Lower priority than correctness fixes.
+
+### CPACF: Hardware Cryptography
+
+All IBM Z processors include CPACF (CP Assist for Cryptographic Functions):
+
+- AES encryption/decryption (KM, KMC instructions)
+- SHA hashing (KIMD, KLMD instructions)
+- True random number generator (TRNG)
+
+**ClickHouse benefit**: OpenSSL automatically leverages CPACF for TLS
+connections. Already enabled in the nix-on-z build
+(`-DENABLE_GRPC_USE_OPENSSL=1`).
+
+**Note on encryption codec**: ClickHouse's `CompressionCodecEncrypted.cpp`
+(lines 100-116) uses `AES-128-GCM` / `AES-256-GCM` on s390x instead of the
+`AES-*-GCM-SIV` variants used on other platforms. This is a historical
+workaround because OpenSSL lacked SIV ciphers when s390x support was added.
+Encrypted data created on s390x is NOT portable to other architectures due
+to this cipher mismatch.
+
+### Existing s390x Code in ClickHouse
+
+ClickHouse already has some s390x-specific code paths:
+
+| File | What | Status |
+|------|------|--------|
+| `base/base/crc32c_s390x.h` | Hardware CRC32C with byte-swap | Working |
+| `base/base/wide_integer_impl.h:302-315` | Endian-aware wide int indexing | Working |
+| `cmake/linux/toolchain-s390x.cmake` | Cross-compilation toolchain | Working |
+| `src/Compression/CompressionCodecEncrypted.cpp:100-116` | Non-SIV cipher fallback | Working (not portable) |
+| `base/base/defines.h:3` | `ARCH_S390X` — marked "work in progress" | Accurate |
+
+### Future Optimization Opportunities (Not Yet Implemented)
+
+These are documented for future reference. The current priority is correctness.
+
+| Opportunity | Expected Benefit | Effort | Priority |
+|-------------|-----------------|--------|----------|
+| **VXE SIMD for hash aggregation** | 2-4x faster GROUP BY | High — requires s390x-specific SIMD kernels with reversed element ordering | Medium |
+| **VXE SIMD for string operations** | 2-3x faster string comparison | Medium — glibc already vectorizes `memcpy`/`strcmp` | Low |
+| **DFLTCC for HTTP gzip** | 10-50x faster gzip responses | Low — link zlib-ng instead of zlib | Medium |
+| **SORTL for ORDER BY** | Unknown — needs benchmarking | High — custom sorting kernel | Low |
+| **Remove SIV cipher workaround** | Cross-platform encrypted data | Low — test with OpenSSL 3.2+ | Low |
+| **LZ4/ZSTD VXE acceleration** | Modest — already fast in software | High — need vectorized LZ4/ZSTD | Low |
+
+**Key risk for future SIMD work**: The reversed element ordering in s390x
+vector registers means that any ClickHouse code using `MULTITARGET_FUNCTION`
+with explicit lane operations cannot be trivially ported. Each SIMD kernel
+would need a dedicated s390x implementation, not just a `#ifdef` swap. This
+is the same challenge that projects like Wasmtime and LLVM faced when adding
+s390x SIMD support.
+
+**Recommendation**: For production s390x deployments, the current scalar
+fallback is correct and adequate. The z15's sustained 5.2 GHz clock partially
+compensates for the lack of wide SIMD (128-bit vs 256/512-bit on x86). SIMD
+optimization should only be pursued after the endianness patches are upstreamed
+and CI coverage is established.
+
+---
+
 ## Confirmed s390x Endianness Bugs
 
 ### FIXED: Big-endian aggregation serialization (6 tests) — Patch 0100
