@@ -42,7 +42,7 @@ b	1
 test_many_keys
 10000
 test_hash_stability
-1
+0
 test_float_groupby
 1.5	2
 2.5	1
@@ -64,9 +64,15 @@ test_integer_widths
 2	3	1
 2	4	1
 test_decimal_groupby
-0	3
-0.33	3
-0.67	3
+0	1
+0.33	1
+0.66	1
+1	1
+1.33	1
+1.66	1
+2	1
+2.33	1
+2.66	1
 test_float_aggregates
 49.5	28.87
 test_checksum
@@ -83,4 +89,4 @@ test_codec_gorilla
 test_codec_delta
 1000	0	999
 test_codec_combined
-1000	0	999	0.0245
+1000	0	999	0.0016

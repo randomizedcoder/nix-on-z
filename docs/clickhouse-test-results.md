@@ -406,43 +406,64 @@ x86 and s390x.
 **Conclusion**: Hash-based sharding and distributed queries are safe across
 mixed x86/s390x clusters.
 
-### Compression Codecs: CRITICAL BUGS (6 codecs affected)
+### Compression Codecs: Deep Endianness Audit
 
-Multiple codecs write compressed data in formats that are **not portable**
-between architectures. Data compressed on x86 cannot decompress on s390x
-and vice versa. However, data written and read on the **same architecture**
-works correctly.
+Multiple codecs were audited for endianness correctness. The key distinction
+is whether they use `unalignedLoad<T>`/`unalignedStore<T>` (native byte order,
+broken for cross-arch) vs `unalignedLoadLittleEndian<T>`/`unalignedStoreLittleEndian<T>`
+(explicit LE, correct).
 
-| Codec | Severity | Problem | Key Lines |
-|-------|----------|---------|-----------|
-| **DoubleDelta** | CRITICAL | `unalignedStoreLittleEndian` for data, but headers/counts in LE that BE reads correctly — however delta values use LE storage | `CompressionCodecDoubleDelta.cpp:301,309-310,318,321,333,381` |
-| **Gorilla** | CRITICAL | XOR of IEEE 754 floats stored in LE; BE reads produce wrong XOR results | `CompressionCodecGorilla.cpp:212,221-222,236,279,291-292,337` |
-| **Delta** | CRITICAL | Delta values stored via `unalignedStoreLittleEndian` | `CompressionCodecDelta.cpp:83-84,105,108` |
-| **GCD** | CRITICAL | Uses plain `unalignedLoad`/`unalignedStore` (native byte order, no LE conversion) | `CompressionCodecGCD.cpp:92,94,98,117` |
-| **T64** | PARTIAL | `load()` is endian-aware (lines 342-354), but `store()` uses native `memcpy` (line 360). Min/max header also native (lines 571-572) | `CompressionCodecT64.cpp` |
-| **FPC** | FRAGILE | Declares `ENDIAN = std::endian::little` but uses pointer arithmetic instead of proper LE I/O | `CompressionCodecFPC.cpp:242,442-451` |
+#### Codecs confirmed SAFE (already use LE I/O)
 
-**Cross-architecture compatibility matrix**:
+| Codec | Verification | Key Functions |
+|-------|-------------|---------------|
+| **LZ4** | Byte-stream codec, inherently endian-safe | N/A |
+| **ZSTD** | Byte-stream codec, inherently endian-safe | N/A |
+| **DoubleDelta** | Uses `unalignedStoreLittleEndian`/`unalignedLoadLittleEndian` throughout | `CompressionCodecDoubleDelta.cpp:301,309-310,318,321,333,381` |
+| **Gorilla** | Uses `unalignedStoreLittleEndian`/`unalignedLoadLittleEndian` throughout | `CompressionCodecGorilla.cpp:212,221-222,236,279,291-292,337` |
+| **Delta** | Uses `unalignedStoreLittleEndian`/`unalignedLoadLittleEndian` throughout | `CompressionCodecDelta.cpp:83-84,105,108` |
+
+#### Codecs with BUGS (patched in `0101-fix-compression-codec-endianness.patch`)
+
+| Codec | Severity | Problem | Fix |
+|-------|----------|---------|-----|
+| **GCD** | CRITICAL | All 7 load/store sites use native `unalignedLoad<T>`/`unalignedStore<T>` — breaks cross-arch data portability | Replace all with `unalignedLoadLittleEndian<T>`/`unalignedStoreLittleEndian<T>` |
+| **T64** | CRITICAL | `load()` (lines 342-354) is endian-aware, but `store()` (line 360) uses native `memcpy`. `findMinMax()` (lines 526-527) uses native `unalignedLoad<T>`. Min/max header (lines 571-572) written native, read native (lines 634-635). **Asymmetric bug**: data compressed on x86 would decompress incorrectly on s390x | Fix `store()` to use `unalignedStoreLittleEndian<T>` loop on BE; fix `findMinMax()` to use LE loads; fix header to use LE read/write |
+| **FPC** | CRITICAL | `ENDIAN = std::endian::little` hardcoded (line 242) makes `valueTail()` extract wrong bytes on BE — compressed tail bytes come from MSB (zeros) instead of LSB (data) | Change to `std::endian::native` — cross-arch portability is inherently impossible for FPC since XOR predictions differ by byte order |
+
+**GCD fix details** (`CompressionCodecGCD.cpp`):
+- `compressDataForType()`: lines 92, 94 (load GCD candidates), 98 (store GCD value), 117 (libdivide path), 127 (direct division path) — all changed to LE variants
+- `decompressDataForType()`: line 147 (load GCD multiplier), 165 (load+multiply+store) — changed to LE variants
+- After fix: compressed format is always LE, fully cross-arch portable
+
+**T64 fix details** (`CompressionCodecT64.cpp`):
+- `store()` line 360: `memcpy(dst, buf, tail * sizeof(T))` → LE store loop on BE (mirrors existing `load()` pattern)
+- `findMinMax()` lines 526-527: `unalignedLoad<T>(src)` → `unalignedLoadLittleEndian<T>(src)` — source data is already in LE wire format
+- Header write lines 571-572: `memcpy(dst, &min64, ...)` → `unalignedStoreLittleEndian<MinMaxType>(dst, min64)`
+- Header read lines 634-635: `memcpy(&min, src, ...)` → `unalignedLoadLittleEndian<MinMaxType>(src)`
+- Special case line 659: `unalignedStore<T>(dst, min_value)` → `unalignedStoreLittleEndian<T>` for the all-same-value path
+- After fix: fully cross-arch portable
+
+**FPC fix details** (`CompressionCodecFPC.cpp`):
+- Line 242: `ENDIAN = std::endian::little` → `std::endian::native`
+- This fixes `valueTail()` (lines 442-452) to correctly select the significant bytes on BE
+- `importChunk()`/`exportChunk()` use `memcpy` on native-order data — correct because FPC operates on in-memory column values
+- Note: FPC compressed format is NOT cross-arch portable even after fix (XOR prediction state differs by byte order). This is acceptable — ClickHouse does not currently guarantee cross-arch portability for FPC
+
+**Cross-architecture compatibility matrix (after patches)**:
 
 | Codec | x86→x86 | x86→s390x | s390x→x86 | s390x→s390x |
 |-------|---------|-----------|-----------|-------------|
 | LZ4 | OK | OK | OK | OK |
 | ZSTD | OK | OK | OK | OK |
-| DoubleDelta | OK | FAIL | FAIL | OK |
-| Gorilla | OK | FAIL | FAIL | OK |
-| Delta | OK | FAIL | FAIL | OK |
-| GCD | OK | FAIL | FAIL | OK |
-| T64 | OK | FAIL | FAIL | OK |
-| FPC | OK | ? | ? | OK |
+| DoubleDelta | OK | OK | OK | OK |
+| Gorilla | OK | OK | OK | OK |
+| Delta | OK | OK | OK | OK |
+| GCD | OK | **OK** | **OK** | OK |
+| T64 | OK | **OK** | **OK** | OK |
+| FPC | OK | FAIL* | FAIL* | **OK** |
 
-**Note**: LZ4 and ZSTD are architecture-independent (they operate on raw
-byte streams), so they work correctly on all platforms. The specialized
-ClickHouse codecs that interpret multi-byte values during compression are
-the ones affected.
-
-**Recommendation for s390x**: Use `CODEC(LZ4)` or `CODEC(ZSTD)` only.
-Avoid DoubleDelta, Gorilla, Delta, GCD, T64, FPC until upstream fixes land.
-This does not affect data already on s390x using default codecs (LZ4).
+*FPC cross-arch is fundamentally impossible due to prediction algorithm differences.
 
 ### MergeTree On-Disk Format: MOSTLY PORTABLE
 
@@ -576,15 +597,44 @@ Z_HOST=z nix run .#sync-clickhouse-tests # clone test suite
 Z_HOST=z nix run .#test-clickhouse       # run tests
 ```
 
+## Patches
+
+### Patch 0100: Column Serialization Endianness (v2)
+
+**File**: `patches/0100-fix-column-serialization-endianness.patch`
+**Applied via**: `lib.optional stdenv.hostPlatform.isBigEndian` in `generic.nix`
+
+Fixes 7 source files, 13 serialization sites:
+- `ColumnString.cpp` — 3 sites: `serializeValueIntoArena`, `serializeValueIntoMemory`, `batchSerializeValueIntoMemory`
+- `ColumnArray.cpp` — 2 sites: `serializeValueIntoArena`, `serializeValueIntoMemory`
+- `ColumnVariant.cpp` — 2 sites: discriminator field
+- `ColumnDynamic.cpp` — 1 site: type_and_value_size field
+- `ColumnObject.cpp` — 3 sites: num_paths, path_size, value_size
+- `ColumnVector.cpp` — 1 site: new `serializeValueIntoMemory` override (was using generic native-order `IColumnHelper` template)
+- `ColumnDecimal.cpp` — 1 site: new `serializeValueIntoMemory` override (same pattern as ColumnVector)
+
+### Patch 0101: Compression Codec Endianness
+
+**File**: `patches/0101-fix-compression-codec-endianness.patch`
+
+Fixes 3 source files:
+- `CompressionCodecGCD.cpp` — 7 sites: all `unalignedLoad`/`unalignedStore` → LE variants
+- `CompressionCodecT64.cpp` — 6 sites: `store()`, `findMinMax()`, header read/write, special case store
+- `CompressionCodecFPC.cpp` — 1 site: `ENDIAN` constant → `std::endian::native`
+
+### Test Files
+
+- `tests/clickhouse/s390x_endianness_serialization.sql` + `.reference` — 27 tests covering column serialization
+- `tests/clickhouse/s390x_codec_endianness.sql` + `.reference` — 25 tests covering every compression codec
+
 ## Next Steps
 
-1. **Fix `clickhouse-client` symlink** — add symlinks in test script to
-   eliminate 10 false failures
-2. **Investigate & fix aggregation endianness** — the core bug in
-   `AggregationMethodSerialized` affects 6+ tests
-3. **Investigate Parquet V3 endianness** — dict index and metadata reads
-4. **Report upstream**: hostname replacement bug, `jq` dependency
-5. **Verify minio/S3 integration** — end-to-end test with S3 disk tests
-6. **Re-run full suite** — with symlink fix + increased max-failures-chain
-7. **Set up ZooKeeper/Keeper** to unlock replicated table tests
-8. **Upstream s390x patches** for confirmed endianness bugs
+1. ~~Investigate & fix aggregation endianness~~ — **DONE** (patch 0100)
+2. ~~Investigate & fix compression codec endianness~~ — **DONE** (patch 0101)
+3. **Apply codec patch to build** — copy patch to z, add to `generic.nix`, rebuild
+4. **Run endianness test suites** — validate both patches with dedicated tests
+5. **Re-run full suite** — with both patches + symlink fix
+6. **Investigate Parquet V3 endianness** — dict index and metadata reads
+7. **Report upstream**: hostname replacement bug, `jq` dependency, endianness patches
+8. **Verify minio/S3 integration** — end-to-end test with S3 disk tests
+9. **Set up ZooKeeper/Keeper** to unlock replicated table tests

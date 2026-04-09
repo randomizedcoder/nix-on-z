@@ -1,0 +1,74 @@
+lz4_uint32
+1000	0	999	499500
+lz4_int64
+1000	-500	499	-500
+lz4_float64
+100	0	108.9	5445
+lz4_string
+1000	0	999
+zstd_uint64
+1000	0	999000	499500000
+delta_uint32
+1000	0	999	499500
+delta_int64
+1000	-500	499	-500
+delta_uint16
+1000	0	999	499500
+doubledelta_uint32
+100	1000000	1099000	104950000
+doubledelta_uint64
+100	1000000000	1000099000	100004950000
+gorilla_float32
+100	0	148.5	7425
+gorilla_float64
+100	-0.9999	0.9996	18.6474
+gcd_uint32
+100	0	594	29700
+gcd_uint64
+100	0	1188	59400
+t64_uint32
+1000	0	999	499500
+t64_uint64
+1000	0	999000	499500000
+t64_int16
+1000	-500	499	-500
+fpc_float32
+1000	0	99.9	49950
+fpc_float64
+1000	-0.999997	1	184.177631
+combined_delta_zstd
+1000	0	999	0.0016	10
+edge_single_value
+1	42	42
+edge_all_zeros
+100	0	0	0
+edge_all_same
+100	12345	12345	1234500
+edge_max_values
+100	4294967196	4294967295
+edge_negative_floats
+100	-9801	-0	-328350
+f64_exact_lz4
+1000	1
+f64_exact_gorilla
+1000	1
+f64_exact_fpc
+1000	1
+f64_special_values
+6	1	2	2
+f64_special_gorilla
+6	1	2	2
+f64_special_fpc
+6	1	2	2
+f64_bitexact_lz4
+100
+f64_bitexact_gorilla
+100
+f64_bitexact_fpc
+100
+f32_exact_gorilla
+1000	1
+f32_exact_fpc
+1000	1
+f64_trig_delta_zstd
+1000	1000	1	1
