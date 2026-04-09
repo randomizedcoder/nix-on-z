@@ -385,6 +385,82 @@ ClickHouse:
 
 ---
 
+## Deep Dive: Endianness Audit of ClickHouse Subsystems
+
+Full source code audit performed against ClickHouse v26.2.4.23-stable to
+identify all endianness-sensitive code paths. Results by subsystem:
+
+### Hash Functions: PORTABLE (no bugs)
+
+CityHash, SipHash, MurmurHash, XXHash all have explicit endianness
+normalization. `SELECT cityHash64('hello')` produces identical results on
+x86 and s390x.
+
+| Component | File | Mechanism |
+|-----------|------|-----------|
+| CityHash | `contrib/cityhash102/src/city.cc:39-64` | `uint64_in_expected_order()` macro, `bswap_64` on BE |
+| MurmurHash3 | `contrib/murmurhash/src/MurmurHash3.cpp:51-88` | `__BYTE_ORDER__` check, manual LE reconstruction |
+| SipHash | `src/Common/SipHash.h:42-46,136` | `unalignedLoadLittleEndian<UInt64>`, `transformEndianness` |
+| FunctionsHashing | `src/Functions/FunctionsHashing.h:958` | `transformEndianness<std::endian::little>` before hashing |
+
+**Conclusion**: Hash-based sharding and distributed queries are safe across
+mixed x86/s390x clusters.
+
+### Compression Codecs: CRITICAL BUGS (6 codecs affected)
+
+Multiple codecs write compressed data in formats that are **not portable**
+between architectures. Data compressed on x86 cannot decompress on s390x
+and vice versa. However, data written and read on the **same architecture**
+works correctly.
+
+| Codec | Severity | Problem | Key Lines |
+|-------|----------|---------|-----------|
+| **DoubleDelta** | CRITICAL | `unalignedStoreLittleEndian` for data, but headers/counts in LE that BE reads correctly — however delta values use LE storage | `CompressionCodecDoubleDelta.cpp:301,309-310,318,321,333,381` |
+| **Gorilla** | CRITICAL | XOR of IEEE 754 floats stored in LE; BE reads produce wrong XOR results | `CompressionCodecGorilla.cpp:212,221-222,236,279,291-292,337` |
+| **Delta** | CRITICAL | Delta values stored via `unalignedStoreLittleEndian` | `CompressionCodecDelta.cpp:83-84,105,108` |
+| **GCD** | CRITICAL | Uses plain `unalignedLoad`/`unalignedStore` (native byte order, no LE conversion) | `CompressionCodecGCD.cpp:92,94,98,117` |
+| **T64** | PARTIAL | `load()` is endian-aware (lines 342-354), but `store()` uses native `memcpy` (line 360). Min/max header also native (lines 571-572) | `CompressionCodecT64.cpp` |
+| **FPC** | FRAGILE | Declares `ENDIAN = std::endian::little` but uses pointer arithmetic instead of proper LE I/O | `CompressionCodecFPC.cpp:242,442-451` |
+
+**Cross-architecture compatibility matrix**:
+
+| Codec | x86→x86 | x86→s390x | s390x→x86 | s390x→s390x |
+|-------|---------|-----------|-----------|-------------|
+| LZ4 | OK | OK | OK | OK |
+| ZSTD | OK | OK | OK | OK |
+| DoubleDelta | OK | FAIL | FAIL | OK |
+| Gorilla | OK | FAIL | FAIL | OK |
+| Delta | OK | FAIL | FAIL | OK |
+| GCD | OK | FAIL | FAIL | OK |
+| T64 | OK | FAIL | FAIL | OK |
+| FPC | OK | ? | ? | OK |
+
+**Note**: LZ4 and ZSTD are architecture-independent (they operate on raw
+byte streams), so they work correctly on all platforms. The specialized
+ClickHouse codecs that interpret multi-byte values during compression are
+the ones affected.
+
+**Recommendation for s390x**: Use `CODEC(LZ4)` or `CODEC(ZSTD)` only.
+Avoid DoubleDelta, Gorilla, Delta, GCD, T64, FPC until upstream fixes land.
+This does not affect data already on s390x using default codecs (LZ4).
+
+### MergeTree On-Disk Format: MOSTLY PORTABLE
+
+| Component | Status | Mechanism |
+|-----------|--------|-----------|
+| Compressed block headers | PORTABLE | `unalignedStoreLittleEndian<UInt32>` (`ICompressionCodec.cpp:96-97`) |
+| Checksums | PORTABLE | `writeBinaryLittleEndian` (`MergeTreeDataPartChecksum.cpp:229`) |
+| Mark files (.mrk/.mrk2/.mrk3) | PORTABLE (fragile) | Written with `writeBinaryLittleEndian`, read via raw `readStrict` + `std::byteswap` on BE (`MergeTreeMarksLoader.cpp:207-216`) |
+| Adaptive mark granularity | PORTABLE | `readBinaryLittleEndian` (`MergeTreeMarksLoader.cpp:197`) |
+| Part metadata (count.txt, columns.txt) | PORTABLE | Text-based serialization |
+
+**Note on mark files**: The read path on big-endian uses a raw read followed
+by manual `std::byteswap` instead of using `readBinaryLittleEndian` like
+the write path. This works but is fragile and inconsistent — a future
+refactor could break it. Worth flagging to upstream.
+
+---
+
 ## Confirmed s390x Endianness Bugs (10 tests)
 
 ### BUG: Big-endian aggregation serialization (6 tests)

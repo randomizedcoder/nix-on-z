@@ -128,3 +128,43 @@ CREATE TABLE test_zstd_endian (val String CODEC(ZSTD)) ENGINE = MergeTree ORDER 
 INSERT INTO test_zstd_endian SELECT toString(number) FROM numbers(1000);
 SELECT count(), min(val), max(val) FROM test_zstd_endian;
 DROP TABLE test_zstd_endian;
+
+-- DoubleDelta codec (known endianness issue — tests same-arch round-trip)
+SELECT 'test_codec_doubledelta';
+DROP TABLE IF EXISTS test_dd_endian;
+CREATE TABLE test_dd_endian (ts UInt64 CODEC(DoubleDelta)) ENGINE = MergeTree ORDER BY ts;
+INSERT INTO test_dd_endian SELECT 1000000 + number * 1000 FROM numbers(100);
+SELECT count(), min(ts), max(ts) FROM test_dd_endian;
+DROP TABLE test_dd_endian;
+
+-- Gorilla codec (known endianness issue — tests same-arch round-trip)
+SELECT 'test_codec_gorilla';
+DROP TABLE IF EXISTS test_gorilla_endian;
+CREATE TABLE test_gorilla_endian (val Float64 CODEC(Gorilla)) ENGINE = MergeTree ORDER BY tuple();
+INSERT INTO test_gorilla_endian SELECT number * 1.1 FROM numbers(100);
+SELECT count(), round(min(val), 1), round(max(val), 1) FROM test_gorilla_endian;
+DROP TABLE test_gorilla_endian;
+
+-- Delta codec (known endianness issue — tests same-arch round-trip)
+SELECT 'test_codec_delta';
+DROP TABLE IF EXISTS test_delta_endian;
+CREATE TABLE test_delta_endian (val Int32 CODEC(Delta, LZ4)) ENGINE = MergeTree ORDER BY val;
+INSERT INTO test_delta_endian SELECT number FROM numbers(1000);
+SELECT count(), min(val), max(val) FROM test_delta_endian;
+DROP TABLE test_delta_endian;
+
+-- Multiple codecs combined: Delta + ZSTD (real-world pattern)
+SELECT 'test_codec_combined';
+DROP TABLE IF EXISTS test_combined_endian;
+CREATE TABLE test_combined_endian (
+    ts DateTime CODEC(Delta, ZSTD),
+    val Float64 CODEC(ZSTD),
+    id UInt32 CODEC(LZ4)
+) ENGINE = MergeTree ORDER BY ts;
+INSERT INTO test_combined_endian SELECT
+    toDateTime('2024-01-01') + number * 60,
+    sin(number / 10.0),
+    number
+FROM numbers(1000);
+SELECT count(), min(id), max(id), round(avg(val), 4) FROM test_combined_endian;
+DROP TABLE test_combined_endian;

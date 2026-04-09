@@ -76,3 +76,11 @@ test_compression_lz4
 1000	0	999
 test_compression_zstd
 1000	0	999
+test_codec_doubledelta
+100	1000000	1099000
+test_codec_gorilla
+100	0	108.9
+test_codec_delta
+1000	0	999
+test_codec_combined
+1000	0	999	0.0245
