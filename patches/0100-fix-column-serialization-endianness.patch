@@ -32,6 +32,46 @@ index 8678433e..8fbf3f22 100644
      memory += sizeof(array_size);
      for (size_t i = 0; i < array_size; ++i)
          memory = getData().serializeValueIntoMemory(offset + i, memory, settings);
+diff --git a/src/Columns/ColumnDecimal.cpp b/src/Columns/ColumnDecimal.cpp
+index 0a387cc0..f3e9a494 100644
+--- a/src/Columns/ColumnDecimal.cpp
++++ b/src/Columns/ColumnDecimal.cpp
+@@ -7,6 +7,7 @@
+ #include <Common/WeakHash.h>
+ #include <Common/assert_cast.h>
+ #include <Common/iota.h>
++#include <Common/transformEndianness.h>
+ 
+ #include <Core/DecimalFunctions.h>
+ #include <Core/TypeId.h>
+@@ -84,6 +85,15 @@ Float64 ColumnDecimal<T>::getFloat64(size_t n) const
+     return DecimalUtils::convertTo<Float64>(data[n], scale);
+ }
+ 
++template <is_decimal T>
++char * ColumnDecimal<T>::serializeValueIntoMemory(size_t n, char * memory, const IColumn::SerializationSettings *) const
++{
++    T value = data[n];
++    transformEndianness<std::endian::little>(value);
++    memcpy(memory, &value, sizeof(T));
++    return memory + sizeof(T);
++}
++
+ template <is_decimal T>
+ void ColumnDecimal<T>::deserializeAndInsertFromArena(ReadBuffer & in, const IColumn::SerializationSettings *)
+ {
+diff --git a/src/Columns/ColumnDecimal.h b/src/Columns/ColumnDecimal.h
+index 63ab1b08..5224f28f 100644
+--- a/src/Columns/ColumnDecimal.h
++++ b/src/Columns/ColumnDecimal.h
+@@ -100,6 +100,7 @@ public:
+ 
+     Float64 getFloat64(size_t n) const final;
+ 
++    char * serializeValueIntoMemory(size_t n, char * memory, const IColumn::SerializationSettings * settings) const override;
+     void deserializeAndInsertFromArena(ReadBuffer & in, const IColumn::SerializationSettings * settings) override;
+     void skipSerializedInArena(ReadBuffer & in) const override;
+     void updateHashWithValue(size_t n, SipHash & hash) const override;
 diff --git a/src/Columns/ColumnDynamic.cpp b/src/Columns/ColumnDynamic.cpp
 index 3bc19736..cadda6e4 100644
 --- a/src/Columns/ColumnDynamic.cpp
@@ -173,3 +213,44 @@ index 1e54605a..e6a2815f 100644
      memory += sizeof(global_discr);
      if (global_discr == NULL_DISCRIMINATOR)
          return memory;
+diff --git a/src/Columns/ColumnVector.cpp b/src/Columns/ColumnVector.cpp
+index bd75467b..0ea49d12 100644
+--- a/src/Columns/ColumnVector.cpp
++++ b/src/Columns/ColumnVector.cpp
+@@ -23,6 +23,7 @@
+ #include <Common/assert_cast.h>
+ #include <Common/findExtreme.h>
+ #include <Common/iota.h>
++#include <Common/transformEndianness.h>
+ #include <DataTypes/FieldToDataType.h>
+ #include <IO/Operators.h>
+ #include <IO/ReadHelpers.h>
+@@ -53,6 +54,15 @@ namespace ErrorCodes
+     extern const int NOT_IMPLEMENTED;
+ }
+ 
++template <typename T>
++char * ColumnVector<T>::serializeValueIntoMemory(size_t n, char * memory, const IColumn::SerializationSettings *) const
++{
++    T value = data[n];
++    transformEndianness<std::endian::little>(value);
++    memcpy(memory, &value, sizeof(T));
++    return memory + sizeof(T);
++}
++
+ template <typename T>
+ void ColumnVector<T>::deserializeAndInsertFromArena(ReadBuffer & in, const IColumn::SerializationSettings *)
+ {
+diff --git a/src/Columns/ColumnVector.h b/src/Columns/ColumnVector.h
+index d75602e0..927fa61d 100644
+--- a/src/Columns/ColumnVector.h
++++ b/src/Columns/ColumnVector.h
+@@ -103,6 +103,8 @@ public:
+         data.resize_assume_reserved(data.size() - n);
+     }
+ 
++    char * serializeValueIntoMemory(size_t n, char * memory, const IColumn::SerializationSettings * settings) const override;
++
+     void deserializeAndInsertFromArena(ReadBuffer & in, const IColumn::SerializationSettings * settings) override;
+ 
+     void skipSerializedInArena(ReadBuffer & in) const override;
