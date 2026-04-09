@@ -233,7 +233,10 @@ cycle — hardware byte-swap is a first-class operation on s390x. The
 performance cost is negligible (one instruction per serialized size field,
 which is dwarfed by the `memcpy` of the actual data).
 
-### Files Changed (5 files, 11 serialization sites)
+### Files Changed (7 files, 13 serialization sites)
+
+**Variable-length columns** — size/length fields written in native byte order
+but read as little-endian:
 
 | File | Function | Line | Field |
 |------|----------|------|-------|
@@ -249,9 +252,21 @@ which is dwarfed by the `memcpy` of the actual data).
 | `ColumnObject.cpp:995` | `serializePathAndValueIntoArena` | 995 | `path_size` |
 | `ColumnObject.cpp:997` | `serializePathAndValueIntoArena` | 997 | `value_size` |
 
+**Fixed-size numeric columns** — raw value bytes in native byte order but
+read as little-endian via `readBinaryLittleEndian<T>`. The generic
+`IColumnHelper::serializeValueIntoMemory` uses `getDataAt(n)` + `memcpy`,
+which copies native byte order. Discovered during testing: `GROUP BY` on a
+`UInt32` column returned byte-swapped values (e.g. `1` became `16777216`
+= `1 << 24`).
+
+| File | Function | Line | Type |
+|------|----------|------|------|
+| `ColumnVector.cpp` (new) | `serializeValueIntoMemory` | 57 | All integer/float types |
+| `ColumnDecimal.cpp` (new) | `serializeValueIntoMemory` | 88 | All decimal types |
+
 ### Fix Pattern
 
-Each site follows the same pattern — convert size to little-endian before `memcpy`:
+**Variable-length columns** — convert size to little-endian before `memcpy`:
 
 ```cpp
 // Before (bug):
@@ -263,8 +278,24 @@ transformEndianness<std::endian::little>(string_size_le);
 memcpy(memory, &string_size_le, sizeof(string_size_le));
 ```
 
+**Fixed-size numeric columns** — override the generic serializer with an
+explicit little-endian version:
+
+```cpp
+// Before (inherited from IColumnHelper — native byte order):
+auto raw_data = self.getDataAt(n);
+memcpy(memory, raw_data.data(), raw_data.size());
+
+// After (new override in ColumnVector/ColumnDecimal):
+T value = data[n];
+transformEndianness<std::endian::little>(value);
+memcpy(memory, &value, sizeof(T));
+```
+
 Uses the existing `transformEndianness` from `Common/transformEndianness.h`,
 which compiles to `std::byteswap` on big-endian and is a no-op on little-endian.
+On s390x, this maps to the hardware `LRVG`/`LRVR` (Load Reversed) instructions
+which execute in a single cycle.
 
 ### Tests Expected to Fix
 
@@ -300,8 +331,57 @@ $CH client --multiquery < ~/s390x_endianness_serialization.sql > /tmp/endian-tes
 diff ~/s390x_endianness_serialization.reference /tmp/endian-test.out
 ```
 
-**Status**: Patch applied to nixpkgs `generic.nix` via `lib.optional stdenv.hostPlatform.isBigEndian`.
-Build in progress on z (2934/14455 as of last check).
+**Status**: Patch v2 applied to nixpkgs `generic.nix` via `lib.optional stdenv.hostPlatform.isBigEndian`.
+Patch v1 (5 files) built and tested — revealed ColumnVector/ColumnDecimal bug
+(`UInt32` values byte-swapped in GROUP BY output: `1` became `16777216` = `1<<24`).
+Patch v2 (7 files) build in progress.
+
+### Historical Context: Endianness Testing Lessons
+
+Research into how Sun Solaris (SPARC, big-endian) and FreeBSD (SPARC64) handled
+endianness testing reveals additional corner cases we should investigate in
+ClickHouse:
+
+**From Sun Solaris/XDR**:
+- Sun's XDR (RFC 4506) mandated big-endian wire format and tested round-trips
+  for every type. ClickHouse intended little-endian wire format (evidenced by
+  `readBinaryLittleEndian`) but didn't enforce it in serializers.
+- ZFS/UFS test suites wrote data on SPARC, verified on x86 — golden-file tests
+  with binary vectors are the highest-value pattern.
+
+**From FreeBSD SPARC64**:
+- Cross-architecture CI: same test suite on amd64 and sparc64, binary test
+  vectors checked into the tree.
+- Any test producing arch-dependent output was flagged as a bug.
+
+**From database projects**:
+- **PostgreSQL**: native byte order on disk, non-portable data dirs. Tests via
+  `pg_dump`/`pg_restore` across architectures.
+- **SQLite**: big-endian on disk unconditionally — binary-identical files everywhere.
+- **MySQL/InnoDB**: wire protocol bugs in replication across architectures were
+  a recurring issue.
+
+**Additional corner cases to investigate in ClickHouse**:
+
+| Risk Area | Pattern | Where to Look |
+|-----------|---------|---------------|
+| Union type punning | `union { uint32_t i; uint8_t b[4]; }` | Hash functions, codecs |
+| Bitfield layout | Bit order reverses on big-endian | Packed structures, flags |
+| Hash output stability | CityHash/SipHash/XXHash byte order | Distributed queries, sharding |
+| Mmap'd structures | Native integers in memory-mapped files | MergeTree marks, checksums |
+| Pointer casting | `*(uint16_t*)&buf[3]` | Compression codecs |
+| FP serialization | `memcpy` of `double` is endian-dependent | Aggregate states |
+| SIMD fallback paths | Scalar path byte-lane assumptions | Vectorized functions |
+
+**Recommended additional tests** (not yet implemented):
+
+1. **Hash stability**: `SELECT cityHash64('test')` must match between x86 and s390x
+2. **Binary round-trip**: Export MergeTree part on x86, import on s390x
+3. **Checksum verification**: `SELECT * FROM system.parts` checksum consistency
+4. **Float GROUP BY**: `GROUP BY` on Float32/Float64 columns
+5. **Decimal arithmetic**: Aggregation on Decimal128/Decimal256 types
+6. **Compression codecs**: LZ4, ZSTD, DoubleDelta, Gorilla on big-endian
+7. **Distributed queries**: Wire format between mixed-endian nodes
 
 ---
 

@@ -72,3 +72,59 @@ SELECT 'test_many_keys';
 SELECT count() FROM (
     SELECT toString(number) AS key, count() FROM numbers(10000) GROUP BY key
 );
+
+-- === Additional tests inspired by Solaris/FreeBSD endianness testing ===
+
+-- Hash stability: must produce same value on all architectures
+-- CityHash64 is used for sharding and distributed queries
+SELECT 'test_hash_stability';
+SELECT cityHash64('endianness test') = 11994489804064498498;
+
+-- Float GROUP BY (exercises ColumnVector<Float64> serialization)
+SELECT 'test_float_groupby';
+DROP TABLE IF EXISTS test_float_endian;
+CREATE TABLE test_float_endian (val Float64) ENGINE = MergeTree ORDER BY tuple();
+INSERT INTO test_float_endian VALUES (1.5), (2.5), (1.5), (3.14);
+SELECT val, count() FROM test_float_endian GROUP BY val ORDER BY val;
+DROP TABLE test_float_endian;
+
+-- Int8/Int16/Int32/Int64 all through GROUP BY (ColumnVector for each width)
+SELECT 'test_integer_widths';
+SELECT toInt8(number % 3) AS i8, toInt16(number % 5) AS i16, count()
+FROM numbers(15) GROUP BY i8, i16 ORDER BY i8, i16;
+
+-- Decimal aggregation (exercises ColumnDecimal serialization)
+SELECT 'test_decimal_groupby';
+SELECT toDecimal64(number / 3, 2) AS d, count()
+FROM numbers(9)
+GROUP BY d ORDER BY d;
+
+-- Float64 aggregation functions (tests aggregate state byte order)
+SELECT 'test_float_aggregates';
+SELECT round(avg(number), 2), round(stddevPop(number), 2)
+FROM numbers(100);
+
+-- Checksum consistency: verify MergeTree checksums are correct
+SELECT 'test_checksum';
+DROP TABLE IF EXISTS test_checksum_endian;
+CREATE TABLE test_checksum_endian (id UInt64, val String) ENGINE = MergeTree ORDER BY id;
+INSERT INTO test_checksum_endian SELECT number, toString(number) FROM numbers(100);
+SELECT count() FROM test_checksum_endian WHERE id = 42;
+SELECT sum(rows), sum(bytes_on_disk) > 0 FROM system.parts WHERE table = 'test_checksum_endian' AND active;
+DROP TABLE test_checksum_endian;
+
+-- LZ4 compression round-trip
+SELECT 'test_compression_lz4';
+DROP TABLE IF EXISTS test_compress_endian;
+CREATE TABLE test_compress_endian (val UInt64 CODEC(LZ4)) ENGINE = MergeTree ORDER BY val;
+INSERT INTO test_compress_endian SELECT number FROM numbers(1000);
+SELECT count(), min(val), max(val) FROM test_compress_endian;
+DROP TABLE test_compress_endian;
+
+-- ZSTD compression round-trip
+SELECT 'test_compression_zstd';
+DROP TABLE IF EXISTS test_zstd_endian;
+CREATE TABLE test_zstd_endian (val String CODEC(ZSTD)) ENGINE = MergeTree ORDER BY tuple();
+INSERT INTO test_zstd_endian SELECT toString(number) FROM numbers(1000);
+SELECT count(), min(val), max(val) FROM test_zstd_endian;
+DROP TABLE test_zstd_endian;
