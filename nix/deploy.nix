@@ -7,6 +7,7 @@
 # fix-permissions       — SSH to z and fix source tree permissions after meson install
 # build-clickhouse      — build ClickHouse natively on z from synced nixpkgs
 # sync-clickhouse-tests — sparse-clone ClickHouse test suite to z
+# sync-clickhouse-local — rsync ClickHouse source+tests from z to local machine
 # test-clickhouse       — run ClickHouse functional tests on z
 { pkgs, self, zScripts }:
 
@@ -210,6 +211,23 @@ REMOTE_SCRIPT
       echo "To build ClickHouse on $Z_HOST:"
       echo "  ssh $Z_HOST"
       echo "  cd ~/nixpkgs && nix-build -A clickhouse --cores \$(nproc) -j 2"
+    '';
+  });
+
+  # Sync ClickHouse source and tests from z to local machine for faster
+  # patch development and test analysis (avoids round-tripping through SSH).
+  sync-clickhouse-local = mkApp (pkgs.writeShellApplication {
+    name = "nix-on-z-sync-clickhouse-local";
+    runtimeInputs = [ pkgs.rsync pkgs.openssh ];
+    text = ''
+      Z_HOST="''${Z_HOST:-z}"
+      BASE_DIR="''${BASE_DIR:-$(pwd)}"
+      echo "Syncing ClickHouse source and tests from $Z_HOST to local..."
+      rsync -avz "$Z_HOST:~/clickhouse-tests/src/" "$BASE_DIR/clickhouse-src/"
+      rsync -avz "$Z_HOST:~/clickhouse-tests/" "$BASE_DIR/../clickhouse-tests/"
+      echo "Sync complete."
+      echo "  Source: $BASE_DIR/clickhouse-src/"
+      echo "  Tests:  $BASE_DIR/../clickhouse-tests/"
     '';
   });
 
@@ -423,18 +441,36 @@ REMOTE_SCRIPT
         exit 1
       fi
 
+      # Create clickhouse-* symlinks (tests invoke subcommands by name)
+      SYMLINK_DIR="/tmp/ch-symlinks"
+      rm -rf "$SYMLINK_DIR"
+      mkdir -p "$SYMLINK_DIR"
+      for cmd in client format server local obfuscator compressor benchmark copier git-import keeper keeper-converter; do
+        ln -sf "$CH" "$SYMLINK_DIR/clickhouse-$cmd"
+      done
+      export PATH="$SYMLINK_DIR:$PATH"
+
       # Clean up any previous test server and minio
       pkill -f "clickhouse server.*ch-test-server" 2>/dev/null || true
+      pkill -f "clickhouse-keeper\|clickhouse keeper" 2>/dev/null || true
       pkill -f "minio server" 2>/dev/null || true
       sleep 1
       rm -rf "$DATA_DIR"
-      mkdir -p "$DATA_DIR"/{data,tmp,user_files,format_schemas,log,access,minio-data}
+      mkdir -p "$DATA_DIR"/{data,tmp,user_files,format_schemas,log,access,minio-data,keeper-log,keeper-snapshot}
 
-      # Ensure jq is available (needed by some tests)
-      if ! command -v jq &>/dev/null; then
-        echo "Installing jq..."
-        sudo apt-get install -y jq
+      # Ensure required tools are available
+      MISSING_PKGS=""
+      command -v jq &>/dev/null || MISSING_PKGS="$MISSING_PKGS jq"
+      command -v expect &>/dev/null || MISSING_PKGS="$MISSING_PKGS expect"
+      command -v curl &>/dev/null || MISSING_PKGS="$MISSING_PKGS curl"
+      if [[ -n "$MISSING_PKGS" ]]; then
+        echo "Installing missing tools:$MISSING_PKGS"
+        sudo apt-get install -y $MISSING_PKGS
       fi
+
+      # Add loopback aliases for tests that connect to 127.0.0.3/4
+      sudo ip addr add 127.0.0.3/8 dev lo 2>/dev/null || true
+      sudo ip addr add 127.0.0.4/8 dev lo 2>/dev/null || true
 
       # Write server config with query_log, clusters, and RBAC support
       cat > "$DATA_DIR/config.xml" <<'XMLEOF'
@@ -455,8 +491,10 @@ REMOTE_SCRIPT
     <interserver_http_port>9009</interserver_http_port>
     <listen_host>127.0.0.1</listen_host>
     <listen_host>127.0.0.2</listen_host>
+    <listen_host>127.0.0.3</listen_host>
+    <listen_host>127.0.0.4</listen_host>
     <mark_cache_size>5368709120</mark_cache_size>
-    <max_concurrent_queries>500</max_concurrent_queries>
+    <max_concurrent_queries>1000</max_concurrent_queries>
 
     <query_log>
         <database>system</database>
@@ -528,7 +566,145 @@ REMOTE_SCRIPT
                 </replica>
             </shard>
         </test_cluster_two_shards_localhost>
+        <test_cluster_two_shards>
+            <shard>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>127.0.0.2</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </test_cluster_two_shards>
+        <test_cluster_two_shards_different_databases>
+            <shard>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>127.0.0.2</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </test_cluster_two_shards_different_databases>
+        <test_cluster_two_shard_three_replicas_localhost>
+            <shard>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>127.0.0.2</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>127.0.0.3</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>127.0.0.2</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>127.0.0.3</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </test_cluster_two_shard_three_replicas_localhost>
+        <test_cluster_one_shard_two_replicas>
+            <shard>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>127.0.0.2</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </test_cluster_one_shard_two_replicas>
+        <test_cluster_interserver_secret>
+            <secret>secret</secret>
+            <shard>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </test_cluster_interserver_secret>
+        <test_cluster_1_shard_3_replicas_1_unavailable>
+            <shard>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>127.0.0.2</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>127.0.0.99</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </test_cluster_1_shard_3_replicas_1_unavailable>
+        <test_cluster_multiple_nodes_all_unavailable>
+            <shard>
+                <replica>
+                    <host>127.0.0.98</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>127.0.0.99</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </test_cluster_multiple_nodes_all_unavailable>
     </remote_servers>
+
+    <keeper_server>
+        <tcp_port>2181</tcp_port>
+        <server_id>1</server_id>
+        <log_storage_path>/tmp/ch-test-server/keeper-log/</log_storage_path>
+        <snapshot_storage_path>/tmp/ch-test-server/keeper-snapshot/</snapshot_storage_path>
+        <coordination_settings>
+            <operation_timeout_ms>10000</operation_timeout_ms>
+            <session_timeout_ms>60000</session_timeout_ms>
+        </coordination_settings>
+        <raft_configuration>
+            <server>
+                <id>1</id>
+                <hostname>127.0.0.1</hostname>
+                <port>9234</port>
+            </server>
+        </raft_configuration>
+    </keeper_server>
+    <zookeeper>
+        <node>
+            <host>127.0.0.1</host>
+            <port>2181</port>
+        </node>
+    </zookeeper>
+
+    <macros>
+        <replica>1</replica>
+        <shard>01</shard>
+    </macros>
 
     <user_directories>
         <users_xml>
@@ -546,12 +722,14 @@ REMOTE_SCRIPT
                 <endpoint>http://127.0.0.1:9001/clickhouse-test/s3_disk/</endpoint>
                 <access_key_id>clickhouse</access_key_id>
                 <secret_access_key>clickhouse</secret_access_key>
+                <skip_access_check>true</skip_access_check>
             </s3_disk>
             <s3_plain_rewritable>
                 <type>s3_plain_rewritable</type>
                 <endpoint>http://127.0.0.1:9001/clickhouse-test/s3_plain/</endpoint>
                 <access_key_id>clickhouse</access_key_id>
                 <secret_access_key>clickhouse</secret_access_key>
+                <skip_access_check>true</skip_access_check>
             </s3_plain_rewritable>
         </disks>
     </storage_configuration>
@@ -612,15 +790,36 @@ XMLEOF
         sleep 2
         if kill -0 "$MINIO_PID" 2>/dev/null; then
           echo "Minio running (PID $MINIO_PID) on http://127.0.0.1:9001"
-          # Create the test bucket
-          if command -v mc &>/dev/null; then
-            mc alias set local http://127.0.0.1:9001 clickhouse clickhouse 2>/dev/null || true
-            mc mb local/clickhouse-test 2>/dev/null || true
-          else
-            # Use curl to create bucket via S3 API
-            curl -s -X PUT http://127.0.0.1:9001/clickhouse-test \
-              -u clickhouse:clickhouse 2>/dev/null || true
-          fi
+          # Create the test bucket via python3 (minio requires AWS4 signing,
+          # plain curl -X PUT with basic auth doesn't work)
+          python3 -c "
+import urllib.request, hashlib, hmac, datetime
+now = datetime.datetime.now(datetime.timezone.utc)
+date = now.strftime('%Y%m%d')
+stamp = now.strftime('%Y%m%dT%H%M%SZ')
+host = '127.0.0.1:9001'
+bucket = 'clickhouse-test'
+region = 'us-east-1'
+service = 's3'
+# AWS4 signing
+def sign(key, msg): return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+key = sign(('AWS4' + 'clickhouse').encode(), date)
+key = sign(key, region)
+key = sign(key, service)
+key = sign(key, 'aws4_request')
+cr = 'PUT\n/' + bucket + '/\n\nhost:' + host + '\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:' + stamp + '\n\nhost;x-amz-content-sha256;x-amz-date\nUNSIGNED-PAYLOAD'
+scope = date + '/' + region + '/' + service + '/aws4_request'
+sts = 'AWS4-HMAC-SHA256\n' + stamp + '\n' + scope + '\n' + hashlib.sha256(cr.encode()).hexdigest()
+sig = hmac.new(key, sts.encode(), hashlib.sha256).hexdigest()
+auth = 'AWS4-HMAC-SHA256 Credential=clickhouse/' + scope + ', SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=' + sig
+req = urllib.request.Request('http://' + host + '/' + bucket + '/', method='PUT')
+req.add_header('Host', host)
+req.add_header('x-amz-content-sha256', 'UNSIGNED-PAYLOAD')
+req.add_header('x-amz-date', stamp)
+req.add_header('Authorization', auth)
+try: urllib.request.urlopen(req)
+except Exception as e: print(f'Bucket creation: {e}')
+" 2>/dev/null || echo "WARNING: Could not create S3 bucket (tests using S3 will fail)"
         else
           echo "WARNING: Minio failed to start, S3 tests will be skipped"
           MINIO_PID=""
@@ -629,15 +828,19 @@ XMLEOF
         echo "Minio not built — S3 tests will be skipped. Run 'nix run .#build-minio' first."
       fi
 
-      echo "Starting ClickHouse test server..."
+      # ClickHouse server starts embedded keeper when it sees <keeper_server>
+      # in the config, so we don't need to start a separate keeper process.
+      KEEPER_PID=""
+
+      echo "Starting ClickHouse test server (with embedded keeper)..."
       export MALLOC_CONF="background_thread:true,prof:true"
       "$CH" server --config-file "$DATA_DIR/config.xml" &
       SERVER_PID=$!
-      sleep 5
+      sleep 10  # extra time for embedded keeper to initialize
 
       if ! kill -0 "$SERVER_PID" 2>/dev/null; then
         echo "ERROR: Server failed to start. Log:"
-        tail -20 "$DATA_DIR/log/clickhouse-server.log"
+        tail -30 "$DATA_DIR/log/clickhouse-server.log"
         exit 1
       fi
 
@@ -652,6 +855,8 @@ XMLEOF
           --queries tests/queries \
           --tmp "$DATA_DIR/tmp" \
           -j 2 \
+          --timeout 600 \
+          --max-failures-chain 9999 \
           2>&1 | tee ~/clickhouse-test-results.log || RESULT=$?
 
       echo ""
@@ -663,6 +868,11 @@ XMLEOF
       echo "Stopping test server..."
       kill "$SERVER_PID" 2>/dev/null || true
       wait "$SERVER_PID" 2>/dev/null || true
+      if [[ -n "$KEEPER_PID" ]]; then
+        echo "Stopping keeper..."
+        kill "$KEEPER_PID" 2>/dev/null || true
+        wait "$KEEPER_PID" 2>/dev/null || true
+      fi
       if [[ -n "$MINIO_PID" ]]; then
         echo "Stopping minio..."
         kill "$MINIO_PID" 2>/dev/null || true

@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nix-on-z <nix-on-z@s390x>
+Date: Mon, 14 Apr 2026 00:00:00 +0000
+Subject: [PATCH] Fix Parquet writer endianness for big-endian platforms
+
+Parquet format requires all multi-byte integers to be stored in
+little-endian byte order. The ClickHouse Parquet writer and Arrow's
+PlainEncoder write values in native byte order, which is wrong on
+big-endian (s390x).
+
+Arrow encoder.cc (3 sites):
+- PlainEncoder::Put: integer column values byte-swapped to LE
+  (floats left in native order to match reader's FloatConverter)
+- UnsafePutByteArray: ByteArray length prefix (uint32) for plain encoding
+- DictEncoderImpl::WriteDict (ByteArray): dictionary string lengths
+
+ClickHouse Write.cpp (2 sites):
+- Footer metadata size: toLittleEndian + raw write
+- RLE rep/def length prefix: toLittleEndian before memcpy
+
+Note: float/double column data is intentionally NOT byte-swapped
+because the ClickHouse native reader (FloatConverter::isTrivial)
+reads float data as raw bytes without endian conversion.
+Dictionary primitive values are not swapped because the reader
+loads them directly without endian conversion.
+
+On little-endian (x86): all conversions are compile-time no-ops,
+producing identical generated code to the original.
+---
+--- a/contrib/arrow/cpp/src/parquet/encoder.cc
++++ b/contrib/arrow/cpp/src/parquet/encoder.cc
+@@ -43,6 +43,7 @@
+ #include "arrow/util/spaced_internal.h"
+ #include "arrow/util/ubsan.h"
+ #include "arrow/visit_data_inline.h"
++#include "arrow/util/endian.h"
+ 
+ #include "parquet/exception.h"
+ #include "parquet/platform.h"
+@@ -162,7 +163,9 @@
+ 
+   void UnsafePutByteArray(const void* data, uint32_t length) {
+     DCHECK(length == 0 || data != nullptr) << "Value ptr cannot be NULL";
+-    sink_.UnsafeAppend(&length, sizeof(uint32_t));
++    // Parquet requires little-endian byte order for the length prefix.
++    uint32_t length_le = bit_util::ToLittleEndian(length);
++    sink_.UnsafeAppend(&length_le, sizeof(uint32_t));
+     sink_.UnsafeAppend(data, static_cast<int64_t>(length));
+     unencoded_byte_array_data_bytes_ += length;
+   }
+@@ -201,7 +204,32 @@
+ template <typename DType>
+ void PlainEncoder<DType>::Put(const T* buffer, int num_values) {
+   if (num_values > 0) {
+-    PARQUET_THROW_NOT_OK(sink_.Append(buffer, num_values * sizeof(T)));
++#if ARROW_LITTLE_ENDIAN
++    PARQUET_THROW_NOT_OK(sink_.Append(buffer, static_cast<int64_t>(num_values) * sizeof(T)));
++#else
++    // Parquet requires little-endian byte order for all multi-byte integer values.
++    // Float/double are NOT swapped here because the ClickHouse native reader
++    // (FloatConverter::isTrivial) reads them as raw bytes without endian conversion.
++    if constexpr (std::is_floating_point_v<T>) {
++      PARQUET_THROW_NOT_OK(sink_.Append(buffer, static_cast<int64_t>(num_values) * sizeof(T)));
++    } else {
++      PARQUET_THROW_NOT_OK(sink_.Reserve(static_cast<int64_t>(num_values) * sizeof(T)));
++      for (int i = 0; i < num_values; ++i) {
++        if constexpr (sizeof(T) == 12) {
++          // Int96: swap each of the three uint32 components individually.
++          const uint32_t* src = reinterpret_cast<const uint32_t*>(&buffer[i]);
++          uint32_t tmp[3];
++          tmp[0] = bit_util::ToLittleEndian(src[0]);
++          tmp[1] = bit_util::ToLittleEndian(src[1]);
++          tmp[2] = bit_util::ToLittleEndian(src[2]);
++          sink_.UnsafeAppend(tmp, sizeof(tmp));
++        } else {
++          T val = bit_util::ToLittleEndian(buffer[i]);
++          sink_.UnsafeAppend(&val, sizeof(T));
++        }
++      }
++    }
++#endif
+   }
+ }
+
+@@ -658,7 +686,9 @@
+ void DictEncoderImpl<ByteArrayType>::WriteDict(uint8_t* buffer) const {
+   memo_table_.VisitValues(0, [&buffer](::std::string_view v) {
+     uint32_t len = static_cast<uint32_t>(v.length());
+-    memcpy(buffer, &len, sizeof(len));
++    // Parquet requires little-endian byte order for the length prefix.
++    uint32_t len_le = bit_util::ToLittleEndian(len);
++    memcpy(buffer, &len_le, sizeof(len_le));
+     buffer += sizeof(len);
+     memcpy(buffer, v.data(), len);
+     buffer += len;
+--- a/src/Processors/Formats/Impl/Parquet/Write.cpp
++++ b/src/Processors/Formats/Impl/Parquet/Write.cpp
+@@ -7,6 +7,7 @@
+ #include <arrow/util/crc32.h>
+ #include <lz4.h>
+ #include <Poco/JSON/JSON.h>
++#include <bit>
+ #include <Poco/JSON/Object.h>
+ #include <xxhash.h>
+ #include <DataTypes/DataTypeObject.h>
+@@ -43,6 +44,18 @@
+ namespace DB::Parquet
+ {
+ 
++/// Parquet stores all multi-byte integers in little-endian byte order.
++/// This helper converts from native byte order to little-endian for writing.
++/// On little-endian platforms it compiles to a no-op.
++template <typename T>
++requires std::is_integral_v<T>
++static inline T toLittleEndian(T x)
++{
++    if constexpr (std::endian::native != std::endian::little)
++        return std::byteswap(x);
++    return x;
++}
++
+ namespace
+ {
+ 
+@@ -676,7 +689,8 @@
+     encoder.Flush();
+     Int32 len = encoder.len();
+ 
+-    memcpy(out.data() + offset, &len, prefix_size);
++    Int32 len_le = toLittleEndian(len);
++    memcpy(out.data() + offset, &len_le, prefix_size);
+     out.resize(offset + prefix_size + len);
+ }
+ 
+@@ -1486,7 +1500,8 @@
+     if (footer_size > INT32_MAX)
+         throw Exception(ErrorCodes::LIMIT_EXCEEDED, "Parquet file metadata too big: {}", footer_size);
+ 
+-    writeIntBinary(static_cast<int>(footer_size), out);
++    Int32 footer_size_le = toLittleEndian(static_cast<Int32>(footer_size));
++    out.write(reinterpret_cast<const char *>(&footer_size_le), sizeof(footer_size_le));
+     out.write("PAR1", 4);
+     file.offset += footer_size + 8;
+ }
