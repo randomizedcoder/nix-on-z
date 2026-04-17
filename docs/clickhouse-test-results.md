@@ -1393,50 +1393,97 @@ significant byte first (matching what x86 does natively).
 | v1 | 2 | 38 OK / 45 FAIL | Structural only (footer + RLE prefix) |
 | v2 | 8+ | 18 OK / 65 FAIL | **Regression** — float swap + dict swap broke round-trip |
 | v3 | 5 | 29 OK / 54 FAIL | Conservative — removed dict/float, but reader still missed dict strings |
-| **v4** | **5** | **41 OK / 42 FAIL** | Paired with 0102 v2 (dict string reader fix) — **best result** |
+| v4 | 5 | 41 OK / 42 FAIL | Paired with 0102 v2 (dict string reader fix) |
+| **v5** | **4** | **pending** | Removed PlainEncoder column data swap — reader uses raw memcpy for same-type |
 
-### v4: Arrow `encoder.cc` Changes (3 sites)
+### v5: Arrow `encoder.cc` Changes (2 sites)
 
 | Site | Line | What Changed |
 |------|------|-------------|
-| `PlainEncoder<DType>::Put` | 202 | LE swap for integers only; `std::is_floating_point_v<T>` skips floats; `sizeof(T)==12` for Int96 |
 | `UnsafePutByteArray` | 165 | `ToLittleEndian(length)` before `UnsafeAppend` |
 | `DictEncoderImpl<ByteArrayType>::WriteDict` | 661 | `ToLittleEndian(len)` before `memcpy` (string lengths only) |
 
-**Intentionally NOT changed**: `DictEncoderImpl<DType>::WriteDict` (primitive) —
-reader loads dict values directly without byte-swap.
+**Intentionally NOT changed**: `PlainEncoder<DType>::Put` — reader uses
+`FixedSizeConverter::isTrivial()` (raw memcpy) for same-type columns,
+so column data must stay in native byte order for round-trip.
 
-All changes guarded by `#if ARROW_LITTLE_ENDIAN` for zero overhead on x86.
-
-### v4: ClickHouse `Write.cpp` Changes (2 sites)
+### v5: ClickHouse `Write.cpp` Changes (2 sites)
 
 | Site | Line | What Changed |
 |------|------|-------------|
 | `encodeRepDefLevelsRLE` | 679 | `toLittleEndian(len)` before memcpy of RLE prefix |
 | Footer size | 1489 | `toLittleEndian(footer_size)` + raw write replacing `writeIntBinary` |
 
-**Deferred to v5**: `StatisticsNumeric::get` (LE stats — causes "min > max" errors),
+**Deferred**: `StatisticsNumeric::get` (LE stats — causes "min > max" errors),
 `ConverterNumberAsFixedString` (wide int byte reversal) — need to verify reader interaction first.
 
-### Key Insight: Writer Must Match Reader
+### Key Insight: The Reader Has Incomplete LE Coverage
 
-The critical lesson from v2's regression is that **the writer must only swap
-values that the reader expects to be in LE**. After fixing 0102 v2 to include
-dictionary page string lengths, the coverage is:
+The critical lesson from iterating through v1-v5 is that **the ClickHouse
+native Parquet reader (V3) has selective, incomplete endian conversion**.
+The writer must match what the reader actually does — not what the Parquet
+spec says it should do.
 
-| Data type | Reader (0102 v2) | Writer (0103 v4) | Status |
-|-----------|-----------------|-----------------|--------|
-| Plain integers | `IntConverter` swaps | `PlainEncoder` swaps | Matched |
-| Plain floats | `FloatConverter` no swap | No swap | Matched |
-| Dict primitive values | No swap (loaded directly) | No swap | Matched |
-| String lengths (plain) | `fromLittleEndian` | `UnsafePutByteArray` LE | Matched |
-| String lengths (dict) | `Dictionary::decode` `fromLittleEndian` | `DictEncoderImpl<ByteArray>` LE | Matched |
-| Structural (footer, RLE) | `fromLittleEndian` | `toLittleEndian` | Matched |
-| Statistics | Reader checks min/max | **Not swapped yet** | **Mismatch — causes 4 failures** |
+**The reader's actual behavior on column data:**
 
-For full Parquet spec compliance, both reader AND writer need to handle
-float and dict primitive value endianness. But for round-trip correctness,
-they must agree — which v4 + 0102 v2 achieves for most data types.
+```
+FixedSizeConverter::isTrivial() == true  →  raw memcpy (NO LE conversion)
+FixedSizeConverter::isTrivial() == false →  IntConverter::convertColumn() (HAS fromLittleEndian)
+FloatConverter::isTrivial() == true      →  raw memcpy (NO LE conversion)
+Dictionary values                        →  raw memcpy into lookup table (NO LE conversion)
+```
+
+`isTrivial()` returns true when the Parquet physical type matches the
+ClickHouse column type exactly (e.g., INT64→Int64). This is the **common
+case** in round-trip tests. `IntConverter` is only used for cross-type
+reads (e.g., Parquet INT32→ClickHouse Int64).
+
+**Consequence**: the writer must NOT byte-swap column data, because the
+reader will raw-memcpy it back. Swapping in the writer without matching
+unswap in the reader produces garbage — confirmed by Run C (v2 regression)
+and Run E (v4 integer corruption in `02735_parquet_encoder`).
+
+**What the writer CAN safely swap** (reader handles these):
+
+| Field | Reader converts? | Writer converts? |
+|-------|-----------------|-----------------|
+| Footer metadata size | `fromLittleEndian` | `toLittleEndian` |
+| RLE rep/def length prefix | `fromLittleEndian` | `toLittleEndian` |
+| DATA_PAGE_V1 rep/def byte lengths | `fromLittleEndian` | (written by Thrift, already LE) |
+| Plain string lengths (ByteArray) | `fromLittleEndian` | `ToLittleEndian` via `UnsafePutByteArray` |
+| Dict page string lengths | `fromLittleEndian` (0102 v2) | `ToLittleEndian` via `DictEncoderImpl<ByteArray>` |
+| RLE/bit-packed dict indices | Arrow `FromLittleEndian` | Arrow `ToLittleEndian` (already correct) |
+
+**What NEITHER side converts** (native byte order on both sides = round-trip works):
+
+| Field | Reader | Writer | Round-trip? | External files? |
+|-------|--------|--------|-------------|-----------------|
+| Same-type integer columns | raw memcpy | raw memcpy | Correct | **BROKEN** (LE data read as BE) |
+| Float/double columns | raw memcpy | raw memcpy | Correct | **BROKEN** |
+| Dict integer values | raw memcpy | raw memcpy | Correct | **BROKEN** |
+| Dict float values | raw memcpy | raw memcpy | Correct | **BROKEN** |
+
+**Theory: full endianness audit needed** (future work)
+
+The current patches achieve round-trip correctness by ensuring writer and
+reader agree. But reading external Parquet files (generated on x86) remains
+broken for same-type integer/float columns because the reader does raw
+memcpy without LE conversion. A full fix would require:
+
+1. Making `FixedSizeConverter::isTrivial()` return false on big-endian
+2. Adding LE→native conversion to all column data paths in the reader
+3. Adding native→LE conversion to all column data paths in the writer
+4. Adding LE conversion to dictionary value loading in the reader
+5. Adding LE conversion to dictionary value writing in the writer
+6. Adding LE conversion to statistics in the writer
+
+This is a significant refactor — essentially every data path needs endian
+awareness. The current patches fix the structural/framing layer (footer,
+RLE, string lengths) which is sufficient for round-trip but not for
+cross-platform file exchange. A comprehensive audit should enumerate every
+`memcpy`/`unalignedLoad` site in both reader and writer, classify each as
+"structural" vs "column data", and ensure consistent LE handling across
+all paths.
 
 ### Design: No-Op on Little-Endian
 
@@ -1474,7 +1521,7 @@ building for s390x or other big-endian targets.
 | **0100** | Column serialization | 13 | `memcpy` of size fields → `transformEndianness<LE>` before write |
 | **0101** | Compression codecs | 14 | GCD/T64: native load/store → LE variants; FPC: hardcoded LE → native |
 | **0102** | Parquet reader | 21 | `memcpy`/`unalignedLoad` of LE values → `fromLittleEndian()` after read (incl. dict page strings) |
-| **0103** | Parquet writer + Arrow | 5 | Arrow PlainEncoder (integers) + ByteArray lengths + structural → `toLittleEndian()` before write |
+| **0103** | Parquet writer + Arrow | 4 | ByteArray string lengths + structural (footer, RLE prefix) → `toLittleEndian()` before write |
 
 ---
 
@@ -1488,14 +1535,15 @@ building for s390x or other big-endian targets.
 6. ~~Set up ZooKeeper/Keeper~~ — **DONE** (embedded keeper, config validated)
 7. ~~Add cluster configs~~ — **DONE** (7 new clusters, zero cluster-not-found errors)
 8. ~~Fix Parquet reader endianness~~ — **DONE** (patch 0102, 20 sites)
-9. ~~Fix Parquet writer endianness~~ — **DONE** (patch 0103 v4)
+9. ~~Fix Parquet writer endianness~~ — **DONE** (patch 0103 v5 — structural + string lengths only)
 10. ~~Discover Arrow PlainEncoder native byte order bug~~ — **DONE** (confirmed by reading encoder.cc)
 11. ~~Validate Parquet round-trip (Run C)~~ — **DONE** (regression: v2 too aggressive)
 12. ~~Fix dictionary page string lengths in reader~~ — **DONE** (0102 v2, `Dictionary::decode()`)
-13. ~~Validate 0102v2 + 0103v4 (Run E)~~ — **DONE** (41 OK / 42 FAIL — best result)
-14. **Add statistics LE to writer** — 4 "min > max" failures from native-order stats
-15. **Add float+dict primitive LE swap to reader+writer** — For cross-platform Parquet interop (future)
-16. **Investigate remaining 42 Parquet failures** — categorize: bool, timestamp, structural, etc.
-17. **Investigate T64/wide-int endianness** — 7 remaining non-Parquet tests
-18. **Full test suite re-run** — After Parquet improvements, target 87%+ pass rate
-19. **Report upstream**: All 4 endianness patches + Arrow encoder fix
+13. ~~Validate 0102v2 + 0103v4 (Run E)~~ — **DONE** (41 OK / 42 FAIL)
+14. ~~Discover reader trivial-path issue~~ — **DONE** (same-type columns use raw memcpy, no LE conversion)
+15. **Validate 0103 v5** — Run F pending (removed PlainEncoder column data swap)
+16. **Full endianness audit** — enumerate every memcpy/unalignedLoad in reader+writer, classify as structural vs column data, decide: fix reader trivial path or keep native-order convention (see theory below)
+17. **Investigate remaining Parquet failures** — categorize: bool, timestamp, structural, etc.
+18. **Investigate T64/wide-int endianness** — 7 remaining non-Parquet tests
+19. **Full test suite re-run** — After Parquet improvements, target 87%+ pass rate
+20. **Report upstream**: All 4 endianness patches + Arrow encoder fix

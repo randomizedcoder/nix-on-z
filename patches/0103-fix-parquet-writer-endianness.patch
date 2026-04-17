@@ -8,9 +8,7 @@ little-endian byte order. The ClickHouse Parquet writer and Arrow's
 PlainEncoder write values in native byte order, which is wrong on
 big-endian (s390x).
 
-Arrow encoder.cc (3 sites):
-- PlainEncoder::Put: integer column values byte-swapped to LE
-  (floats left in native order to match reader's FloatConverter)
+Arrow encoder.cc (2 sites):
 - UnsafePutByteArray: ByteArray length prefix (uint32) for plain encoding
 - DictEncoderImpl::WriteDict (ByteArray): dictionary string lengths
 
@@ -18,11 +16,11 @@ ClickHouse Write.cpp (2 sites):
 - Footer metadata size: toLittleEndian + raw write
 - RLE rep/def length prefix: toLittleEndian before memcpy
 
-Note: float/double column data is intentionally NOT byte-swapped
-because the ClickHouse native reader (FloatConverter::isTrivial)
-reads float data as raw bytes without endian conversion.
-Dictionary primitive values are not swapped because the reader
-loads them directly without endian conversion.
+Note: column data (integers, floats) is intentionally NOT byte-swapped.
+The ClickHouse native reader uses FixedSizeConverter::isTrivial() for
+same-type columns (raw memcpy, no LE conversion) and IntConverter for
+cross-type columns (has fromLittleEndian). Since most round-trip tests
+use same-type columns, swapping column data breaks round-trip.
 
 On little-endian (x86): all conversions are compile-time no-ops,
 producing identical generated code to the original.
@@ -48,41 +46,7 @@ producing identical generated code to the original.
      sink_.UnsafeAppend(data, static_cast<int64_t>(length));
      unencoded_byte_array_data_bytes_ += length;
    }
-@@ -201,7 +204,32 @@
- template <typename DType>
- void PlainEncoder<DType>::Put(const T* buffer, int num_values) {
-   if (num_values > 0) {
--    PARQUET_THROW_NOT_OK(sink_.Append(buffer, num_values * sizeof(T)));
-+#if ARROW_LITTLE_ENDIAN
-+    PARQUET_THROW_NOT_OK(sink_.Append(buffer, static_cast<int64_t>(num_values) * sizeof(T)));
-+#else
-+    // Parquet requires little-endian byte order for all multi-byte integer values.
-+    // Float/double are NOT swapped here because the ClickHouse native reader
-+    // (FloatConverter::isTrivial) reads them as raw bytes without endian conversion.
-+    if constexpr (std::is_floating_point_v<T>) {
-+      PARQUET_THROW_NOT_OK(sink_.Append(buffer, static_cast<int64_t>(num_values) * sizeof(T)));
-+    } else {
-+      PARQUET_THROW_NOT_OK(sink_.Reserve(static_cast<int64_t>(num_values) * sizeof(T)));
-+      for (int i = 0; i < num_values; ++i) {
-+        if constexpr (sizeof(T) == 12) {
-+          // Int96: swap each of the three uint32 components individually.
-+          const uint32_t* src = reinterpret_cast<const uint32_t*>(&buffer[i]);
-+          uint32_t tmp[3];
-+          tmp[0] = bit_util::ToLittleEndian(src[0]);
-+          tmp[1] = bit_util::ToLittleEndian(src[1]);
-+          tmp[2] = bit_util::ToLittleEndian(src[2]);
-+          sink_.UnsafeAppend(tmp, sizeof(tmp));
-+        } else {
-+          T val = bit_util::ToLittleEndian(buffer[i]);
-+          sink_.UnsafeAppend(&val, sizeof(T));
-+        }
-+      }
-+    }
-+#endif
-   }
- }
-
-@@ -658,7 +686,9 @@
+@@ -658,7 +661,9 @@
  void DictEncoderImpl<ByteArrayType>::WriteDict(uint8_t* buffer) const {
    memo_table_.VisitValues(0, [&buffer](::std::string_view v) {
      uint32_t len = static_cast<uint32_t>(v.length());
