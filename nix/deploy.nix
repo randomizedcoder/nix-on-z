@@ -420,10 +420,18 @@ REMOTE_SCRIPT
     runtimeInputs = [ pkgs.openssh ];
     text = ''
       Z_HOST="''${Z_HOST:-z}"
+      TEST_FILTER="''${TEST_FILTER:-}"
+      TEST_TIMEOUT="''${TEST_TIMEOUT:-600}"
       echo "Running ClickHouse tests on $Z_HOST..."
+      if [[ -n "$TEST_FILTER" ]]; then
+        echo "  Test filter: $TEST_FILTER"
+      fi
+      echo "  Per-test timeout: $TEST_TIMEOUT sec"
       # shellcheck disable=SC2029
-      ssh "$Z_HOST" 'bash -s' <<'REMOTE_SCRIPT'
+      ssh "$Z_HOST" "bash -s '$TEST_FILTER' '$TEST_TIMEOUT'" <<'REMOTE_SCRIPT'
       set -euo pipefail
+      TEST_FILTER="$1"
+      TEST_TIMEOUT="$2"
 
       CH=~/nixpkgs/result/bin/clickhouse
       TEST_DIR=~/clickhouse-tests
@@ -850,13 +858,17 @@ except Exception as e: print(f'Bucket creation: {e}')
       # Run the stateless functional tests (the main test suite)
       cd "$TEST_DIR"
       RESULT=0
+      # Split TEST_FILTER on whitespace into positional args (each becomes a regex filter)
+      # shellcheck disable=SC2206
+      FILTER_ARGS=( $TEST_FILTER )
       python3 tests/clickhouse-test \
           --binary "$CH" \
           --queries tests/queries \
           --tmp "$DATA_DIR/tmp" \
           -j 2 \
-          --timeout 600 \
+          --timeout "$TEST_TIMEOUT" \
           --max-failures-chain 9999 \
+          "''${FILTER_ARGS[@]}" \
           2>&1 | tee ~/clickhouse-test-results.log || RESULT=$?
 
       echo ""

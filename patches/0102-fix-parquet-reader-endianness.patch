@@ -16,12 +16,14 @@ Reader.cpp (4 sites):
 - DATA_PAGE_V1 rep/def level byte lengths (2x memcpy of 4-byte LE uint32)
 - Bloom filter word reads (unalignedLoad of LE uint32)
 
-Decoding.cpp (18 sites):
+Decoding.cpp (21 sites):
 - RLE length prefix (memcpy of 4-byte LE uint32)
 - RLE run values (memcpy of variable-width LE int)
 - Bit-packed 8-byte reads (memcpy of LE uint64 for bit extraction)
 - String length prefixes (5x memcpy of 4-byte LE uint32)
 - Dictionary page string lengths (memcpy of 4-byte LE uint32)
+- Dictionary fixed-size index fast-path (raw memcpy of LE column values, v3)
+- memcpyIntoColumn plain fixed-size column data fast-path (v3)
 - Integer column conversion (memcpy of LE integers)
 - Integer statistics (unalignedLoad of LE uint16/32/64)
 - Float statistics (memcpy of LE float32/64)
@@ -145,7 +147,40 @@ instruction, which executes in a single cycle on z15.
              size_t len = 4 + size_t(x);
              if (len > size_t(end - ptr))
                  throw Exception(ErrorCodes::INCORRECT_DATA, "Encoded string is out of bounds");
-@@ -1300,6 +1322,7 @@
+@@ -1232,6 +1254,14 @@
+     size_t size = indexes.size();
+     for (size_t i = 0; i < size; ++i)
+         memcpy(to.data() + i * value_size, data.data() + indexes[i] * value_size, value_size);
++    /// Parquet stores column data in little-endian; swap to native on BE after the gather memcpy.
++    if constexpr (std::endian::native != std::endian::little
++                  && (value_size == 2 || value_size == 4 || value_size == 8))
++    {
++        using U = std::conditional_t<value_size == 2, uint16_t, std::conditional_t<value_size == 4, uint32_t, uint64_t>>;
++        auto * p = reinterpret_cast<U *>(to.data());
++        for (size_t i = 0; i < size; ++i) p[i] = std::byteswap(p[i]);
++    }
+ }
+
+ void Dictionary::index(const ColumnUInt32 & indexes_col, IColumn & out)
+@@ -1289,4 +1320,16 @@
+     auto to = col.insertRawUninitialized(num_values);
+     chassert(to.size() == num_values * value_size);
+     memcpy(to.data(), data, to.size());
++    /// Parquet stores column data in little-endian; swap to native on BE.
++    /// value_size 1 (booleans) and 16 (wide ints) are handled by other code paths.
++    if constexpr (std::endian::native != std::endian::little)
++    {
++        switch (value_size)
++        {
++            case 2: { auto * p = reinterpret_cast<uint16_t *>(to.data()); for (size_t i = 0; i < num_values; ++i) p[i] = std::byteswap(p[i]); break; }
++            case 4: { auto * p = reinterpret_cast<uint32_t *>(to.data()); for (size_t i = 0; i < num_values; ++i) p[i] = std::byteswap(p[i]); break; }
++            case 8: { auto * p = reinterpret_cast<uint64_t *>(to.data()); for (size_t i = 0; i < num_values; ++i) p[i] = std::byteswap(p[i]); break; }
++            default: break;
++        }
++    }
+ }
+
+@@ -1300,6 +1343,7 @@
          /// (Can't reinterpret_cast<const From *>(from_bytes) because pointer may be unaligned).
          From x;
          memcpy(&x, from_bytes + i * sizeof(From), sizeof(From));

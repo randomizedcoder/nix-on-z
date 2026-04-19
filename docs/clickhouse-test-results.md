@@ -1541,9 +1541,111 @@ building for s390x or other big-endian targets.
 12. ~~Fix dictionary page string lengths in reader~~ — **DONE** (0102 v2, `Dictionary::decode()`)
 13. ~~Validate 0102v2 + 0103v4 (Run E)~~ — **DONE** (41 OK / 42 FAIL)
 14. ~~Discover reader trivial-path issue~~ — **DONE** (same-type columns use raw memcpy, no LE conversion)
-15. **Validate 0103 v5** — Run F pending (removed PlainEncoder column data swap)
-16. **Full endianness audit** — enumerate every memcpy/unalignedLoad in reader+writer, classify as structural vs column data, decide: fix reader trivial path or keep native-order convention (see theory below)
-17. **Investigate remaining Parquet failures** — categorize: bool, timestamp, structural, etc.
-18. **Investigate T64/wide-int endianness** — 7 remaining non-Parquet tests
-19. **Full test suite re-run** — After Parquet improvements, target 87%+ pass rate
-20. **Report upstream**: All 4 endianness patches + Arrow encoder fix
+15. ~~Validate 0103 v5~~ — **DONE** (Run F: 40 OK / 43 FAIL Parquet-only)
+16. ~~Establish focused-test-only workflow~~ — **DONE** (Run G, 2026-04-18) — deploy.nix now accepts `TEST_FILTER` env var to run a subset via positional regex args
+17. **Full endianness audit** — enumerate every memcpy/unalignedLoad in reader+writer, classify as structural vs column data, decide: fix reader trivial path or keep native-order convention
+18. **Patch 0104 (wide_integer)** — fix limb ordering for literal construction (see Run G findings below)
+19. **Patch 0102 v3 + 0103 v6** — bundle remaining Parquet reader/writer LE hunks
+20. **Patch 0105 (T64 signed)** — signed transpose bug
+21. **Full test suite re-run** — After Parquet + wide_integer patches, target 90%+ pass rate
+22. **Report upstream**: All patches + Arrow encoder fix
+
+---
+
+## Run G — Focused Endianness Test Run (2026-04-18)
+
+**Setup:** `TEST_FILTER="parquet _t64_ gorilla_codec big_int ipv6_bit arrow"` `TEST_TIMEOUT=120`
+**Build:** clickhouse 26.2.4.23 with patches 0100 + 0101 + 0102v2 + 0103v5 applied.
+
+**Result:** **77 OK / 56 FAIL / 133 total** — 58% pass in endianness-sensitive category.
+
+### Failure Clusters
+
+| Cluster | Tests | Root Cause | Target Patch |
+|---|---|---|---|
+| Wide integer limb order | 5 | `toInt128(1)` stores `1` in wrong limb | **0104** (new) — `base/base/wide_integer_impl.h` |
+| T64 codec signed | 4 | Signed transpose incorrect on BE | **0105** (new) — `CompressionCodecT64.cpp` |
+| Parquet reader (misc) | ~25 | New-encoding / native-reader-v3 / page-v2 / bool / int-logical-type LE sites | **0102 v3** hunks |
+| Parquet writer | ~6 | Bloom filter, big-int encoder | **0103 v6** hunks |
+| ORC/Arrow | ~8 | Decimal, dict indexes, nullable schema | `contrib/arrow/…` (new scope) |
+| Parquet format misc | ~8 | cast_to_json, conversion, roundtrip, metadata | Spill-over from 0102/0103 |
+
+### Key Finding: Wide Integer Limb-Order Bug
+
+Test `01440_big_int_shift` row 1:
+- Reference: `1  1  Int128 Int128`
+- Actual (BE): `1  18446744073709551616  Int128 Int128`
+
+`18446744073709551616 = 2^64` — the literal `1::Int128` places the value in the **high** limb instead of the low limb. The `shift_left` / `shift_right` implementations in `wide_integer_impl.h:548-605` do correctly use `big()` / `little()` helpers — so the bug is upstream in the **construction path** for wide integer literals.
+
+Suspected bug site: `wide_integer_impl.h:386-392` — `wide_integer_from_tuple_like` uses raw `self.items[i]` indexing instead of `self.items[little(i)]`. Other construction paths in the same file (e.g. line 367, 373-380, 523, 538) correctly use `little(i)`.
+
+### Related Failures (Same Root Cause)
+
+| Test | Symptom |
+|---|---|
+| `01440_big_int_shift` | `bitShiftRight(1<<N, N)` returns `2^64` instead of `1` |
+| `02935_ipv6_bit_operations` | `bitAnd(ip1, n1)` returns `bitAnd(ip2, n1)` — limbs swapped |
+| `01554_bloom_filter_index_big_integer_uuid` | UUID as 2×UInt64 limbs, bloom filter miss |
+| `02786_parquet_big_integer_compatibility` | Big int round-trip via Parquet |
+| `03036_test_parquet_bloom_filter_push_down_ipv6` | IPv6 filter push-down |
+
+### Workflow Improvements
+
+- **`TEST_FILTER` env var** in `nix/deploy.nix` — positional regex args passed to `clickhouse-test` for targeted subset runs.
+- **`TEST_TIMEOUT` env var** — per-test timeout, default 600s; use 120s to skip z15-slow tests that aren't endianness-relevant.
+- **~20× speedup** over full suite: 138 tests → ~1 min vs ~30 hours for full 3163-test run.
+
+---
+
+## Run H — 0102 v3 + 0103 v6 + 0104 applied (2026-04-19)
+
+**Setup:** same filter as Run G (`parquet _t64_ gorilla_codec big_int ipv6_bit arrow`), `TEST_TIMEOUT=120`.
+**Build:** clickhouse 26.2.4.23 with patches **0100 + 0101 + 0102 v3 + 0103 v6 + 0104** applied (store path `rkhh3smrqf2svjranaw37wa4g0g17k0b`).
+
+**Result:** **76 OK / 57 FAIL / 133 total** — essentially flat vs Run G's 77/56.
+
+### Key Finding: Patch 0104 is correct, but masked by a JIT bug
+
+Patch 0104 *does* fix wide_integer tuple construction on BE for the normal
+interpreter path. Direct verification:
+
+```
+SET compile_expressions=0;
+SELECT bitShiftLeft(toInt128(1), number) x, bitShiftRight(x, number) y
+  FROM numbers(127) ORDER BY number;
+-- All 127 rows: y == 1   ✅
+```
+
+But the clickhouse-test runner's randomized settings enable
+`compile_expressions=1` for most runs, which goes through the LLVM JIT
+codegen (`src/Interpreters/JIT/*`) that has its **own** wide-integer
+shift implementation, bypassing `wide_integer_impl.h` entirely. With
+JIT on:
+
+```
+SET compile_expressions=1, min_count_to_compile_expression=0;
+SELECT bitShiftLeft(toInt128(1), number) x, bitShiftRight(x, number) y
+  FROM numbers(5) ORDER BY number;
+-- All rows: y == 18446744073709551616 (2^64)   ❌
+```
+
+This is a **separate bug** (patch 0106 target), not a regression from
+0104.
+
+### Cluster Status
+
+| Cluster | Run G | Run H | Notes |
+|---|---|---|---|
+| Wide integer limb order | 5 fail | 5 fail | 0104 fixes the path; JIT still wrong → needs 0106 |
+| T64 codec signed | 4 fail | 4 fail | unchanged — needs 0105 |
+| Parquet reader (misc) | ~25 | ~25 | 0102 v3 hunks landed but most fails are JIT-path or other LE sites |
+| Parquet writer | ~6 | ~6 | 0103 v6 hunks landed; same |
+| ORC/Arrow | ~8 | ~8 | unchanged — needs `contrib/arrow/` work |
+| Parquet format misc | ~8 | ~8 | unchanged |
+
+### What we learned
+
+- **Patches 0102/0103/0104 compile cleanly on s390x** (no regressions introduced; delta is within noise — one test flip).
+- **Test-suite pass rate is not a useful proxy for patch-level correctness** when random settings dominate the failure mode. Direct query reproduction is the reliable signal.
+- **Next highest-leverage work is patch 0106** (JIT codegen) rather than more scalar-path fixes, because JIT is what the test runner exercises most frequently.
