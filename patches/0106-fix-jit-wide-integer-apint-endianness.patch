@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nix-on-z <nix-on-z@s390x>
+Date: Sun, 19 Apr 2026 00:00:00 +0000
+Subject: [PATCH] Fix JIT constant materialization of wide integers on big-endian
+
+`llvm::APInt(unsigned numBits, ArrayRef<uint64_t> bigVal)` takes its
+limbs in little-endian-word order (index 0 is the least-significant
+64-bit word). The wide_integer storage layout stores its low limb at
+`items[little(0)]`, which is:
+
+    little(0) = 0              on little-endian
+    little(0) = item_count - 1 on big-endian
+
+So passing `element.items` directly to the APInt constructor is only
+correct on little-endian. On big-endian (s390x) it feeds the most-
+significant word into the least-significant APInt slot and vice versa,
+causing every JIT-compiled expression that materializes an Int128 /
+Int256 / UInt128 / UInt256 / Decimal128 / Decimal256 constant to see
+the wrong value. Symptom: `toInt128(1)` inside a compound JIT-compiled
+expression evaluates to 2^64 instead of 1.
+
+Fix: on big-endian, reverse the limb order into a stack-local array
+before constructing the APInt, so the low limb ends up in slot 0 as
+APInt expects. On little-endian the reorder is a plain copy and the
+optimizer folds it out.
+
+This is the JIT-path counterpart to patch 0104, which fixed the same
+kind of limb-order confusion in `wide_integer_from_tuple_like`.
+---
+--- a/src/DataTypes/Native.cpp
++++ b/src/DataTypes/Native.cpp
+@@ -1,5 +1,8 @@
+ #include <DataTypes/Native.h>
+ #include <Columns/ColumnDecimal.h>
++#include <array>
++#include <bit>
++#include <cstdint>
+ 
+ #if USE_EMBEDDED_COMPILER
+ #    include <DataTypes/DataTypeDateTime64.h>
+@@ -11,6 +14,26 @@
+ namespace DB
+ {
+ 
++namespace
++{
++
++/// `llvm::APInt(numBits, ArrayRef<uint64_t>)` takes limbs in least-significant-first
++/// order, but wide_integer storage places the low limb at items[little(i)] where
++/// little(0) == 0 on LE and little(0) == item_count - 1 on BE. On BE we must
++/// reverse the limb array before handing it to APInt.
++template <typename Items>
++static inline auto reorderLimbsForAPInt(const Items & items)
++    -> std::array<std::uint64_t, sizeof(Items) / sizeof(std::uint64_t)>
++{
++    constexpr std::size_t n = sizeof(Items) / sizeof(std::uint64_t);
++    std::array<std::uint64_t, n> reordered{};
++    for (std::size_t i = 0; i < n; ++i)
++        reordered[i] = (std::endian::native == std::endian::little) ? items[i] : items[n - 1 - i];
++    return reordered;
++}
++
++}
++
+ namespace ErrorCodes
+ {
+     extern const int NOT_IMPLEMENTED;
+@@ -241,7 +264,8 @@
+                 return llvm::ConstantInt::get(type, static_cast<uint64_t>(element), is_signed_v<T>);
+             else
+             {
+-                llvm::APInt value(type->getIntegerBitWidth(), element.items);
++                auto limbs = reorderLimbsForAPInt(element.items);
++                llvm::APInt value(type->getIntegerBitWidth(), limbs);
+                 return llvm::ConstantInt::get(type, value);
+             }
+         }
+@@ -251,7 +275,8 @@
+                 return llvm::ConstantInt::get(type, static_cast<uint64_t>(element.value), true);
+             else
+             {
+-                llvm::APInt value(type->getIntegerBitWidth(), element.value.items);
++                auto limbs = reorderLimbsForAPInt(element.value.items);
++                llvm::APInt value(type->getIntegerBitWidth(), limbs);
+                 return llvm::ConstantInt::get(type, value);
+             }
+         }

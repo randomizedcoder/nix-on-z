@@ -1649,3 +1649,55 @@ This is a **separate bug** (patch 0106 target), not a regression from
 - **Patches 0102/0103/0104 compile cleanly on s390x** (no regressions introduced; delta is within noise — one test flip).
 - **Test-suite pass rate is not a useful proxy for patch-level correctness** when random settings dominate the failure mode. Direct query reproduction is the reliable signal.
 - **Next highest-leverage work is patch 0106** (JIT codegen) rather than more scalar-path fixes, because JIT is what the test runner exercises most frequently.
+
+## Run I — 0102 v3 + 0103 v6 + 0104 + 0106 applied (2026-04-20)
+
+**Setup:** filter expanded to `parquet _t64_ gorilla_codec big_int ipv6_bit arrow wide_integer`, `TEST_TIMEOUT=120`.
+**Build:** clickhouse 26.2.4.23 with patches **0100 + 0101 + 0102 v3 + 0103 v6 + 0104 + 0106** (store path `825549aw1lga1iahc599safdi5h1y77g`).
+
+**Result:** **79 OK / 56 FAIL / 135 total** — patch 0106 fixes the JIT wide-integer path that was masking 0104.
+
+### Direct Verification of 0106
+
+```
+~/nixpkgs/result/bin/clickhouse local --query \
+  "SELECT bitShiftRight(bitShiftLeft(toInt128(1), number), number) \
+   FROM numbers(5) SETTINGS compile_expressions=1, min_count_to_compile_expression=0"
+1
+1
+1
+1
+1
+```
+
+Pre-0106 this returned `2^64` (18446744073709551616) for every row.
+
+### Tests Newly Passing in Run I (vs Run H)
+
+| Test | Run H | Run I | Reason |
+|---|---|---|---|
+| `01440_big_int_shift` | FAIL | OK | 0106 fixes JIT-codegen Int128 constant materialization |
+
+### Remaining Failure Clusters
+
+| Cluster | Run H | Run I | Notes |
+|---|---|---|---|
+| T64 codec | 4 | 4 | unchanged — needs 0105 (signed bit-transpose) |
+| Parquet reader/writer | ~31 | ~30 | unchanged — separate LE sites |
+| ORC/Arrow | ~8 | ~8 | unchanged — `contrib/arrow/` |
+| Wide integer (cross-platform / double) | n/a | 2 | 03456/03457 newly in filter; cross-platform consistency intentional BE/LE divergence + double-conversion edge cases |
+| IPv6 bit ops | 1 | 1 | unchanged |
+| Bloom filter big int | 1 | 1 | unchanged |
+
+### Infrastructure Fix in This Run
+
+Bucket creation against minio raced against minio's HTTP listener becoming
+ready (`sleep 2` was insufficient on a loaded host). Replaced with a
+30 × 1 s poll of `http://127.0.0.1:9001/minio/health/live`. Without this
+fix, the server failed startup with `NoSuchBucket` and zero tests ran.
+
+### Next Steps
+
+- Patch 0105 (T64 signed transpose) — investigation in progress; test-failure pattern (`1 1 1 0 1 0 1 0` for value=1 columns of signed types) and CompressionCodecT64.cpp `transposeBytes`/`reverseTransposeBytes` byte-aliasing analysis suggest the bug is in the load/store asymmetry plus byte-aliasing in `transposeBytes`. Not yet a single-line fix.
+- Investigate `02935_ipv6_bit_operations` (different shape from wide-integer JIT)
+- Investigate `01554_bloom_filter_index_big_integer_uuid`

@@ -795,7 +795,14 @@ XMLEOF
           --console-address 127.0.0.1:9002 \
           > "$DATA_DIR/log/minio.log" 2>&1 &
         MINIO_PID=$!
-        sleep 2
+        # Wait for minio's HTTP listener to actually be ready; sleep 2 raced
+        # against bucket-creation on a loaded host.
+        for _ in $(seq 1 30); do
+          if curl -sS -o /dev/null -m 2 http://127.0.0.1:9001/minio/health/live; then
+            break
+          fi
+          sleep 1
+        done
         if kill -0 "$MINIO_PID" 2>/dev/null; then
           echo "Minio running (PID $MINIO_PID) on http://127.0.0.1:9001"
           # Create the test bucket via python3 (minio requires AWS4 signing,
