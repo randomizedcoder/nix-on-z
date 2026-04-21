@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nix-on-z <nix-on-z@s390x>
+Date: Sun, 19 Apr 2026 00:00:00 +0000
+Subject: [PATCH] Fix T64 transposeBytes byte extraction on big-endian
+
+`transposeBytes<T>` extracts the k-th byte of a native integer via
+memory aliasing:
+
+    const UInt8 * value8 = reinterpret_cast<const UInt8 *>(&value);
+    matrix8[64 * k + col] = value8[k];
+
+On little-endian `value8[k]` is the k-th least-significant byte.
+On big-endian `value8[k]` is the k-th MOST-significant byte, so the
+bytes end up stored in the transpose matrix in reversed positional
+order.
+
+`reverseTransposeBytes<T>` however uses arithmetic shifts:
+
+    value |= static_cast<U>(matrix8[64 * k + col]) << (8 * k);
+
+which unambiguously places matrix row k into value's k-th
+least-significant byte. That is correct on both LE and BE.
+
+The asymmetry means a T64 round-trip on BE silently reverses the byte
+positions within each value. Combined with patch 0101's
+`unalignedLoadLittleEndian` load/store (which byte-swaps the column
+buffer so the transpose operates on a logical LE value), the result
+is that a UInt16 input of 256 (0x0100) decodes to 1 (0x0001) and 512
+(0x0200) decodes to 2 (0x0002) — a whole-byte swap within each value.
+
+Empirically reproducible on s390x with stock patches applied:
+
+    CREATE TABLE t1 (x UInt16 CODEC(T64, ZSTD))
+      ENGINE=MergeTree ORDER BY tuple();
+    INSERT INTO t1 VALUES (0),(256),(512);
+    SELECT x FROM t1;
+    -- produces: 0, 1, 2   (expected: 0, 256, 512)
+
+Fix: make `transposeBytes` byte extraction shift-based so it is
+value-preserving (endian-agnostic) and symmetric with
+`reverseTransposeBytes`. On LE the compiler lowers
+`(value >> (8*k)) & 0xFF` to the same byte-load as the memory
+aliasing did before, so codegen is unchanged on the common path.
+
+This is the counterpart of the load/store byte-swap in patch 0101:
+with that patch the values inside `buf[]` live in a logical LE
+domain, and the transpose must respect that domain rather than the
+native byte order of the host.
+
+Tests affected: 00870_t64_codec, 00871_t64_codec_signed, and every
+other T64-using test that was previously decoding to zeros or
+byte-swapped values on s390x.
+---
+--- a/src/Compression/CompressionCodecT64.cpp
++++ b/src/Compression/CompressionCodecT64.cpp
+@@ -287,27 +287,28 @@ void transpose64x8(UInt64 * src_dst)
+ template <typename T>
+ void transposeBytes(T value, UInt64 * matrix, UInt32 col)
+ {
+     UInt8 * matrix8 = reinterpret_cast<UInt8 *>(matrix);
+-    const UInt8 * value8 = reinterpret_cast<const UInt8 *>(&value);
++    using U = std::make_unsigned_t<T>;
++    const U uvalue = static_cast<U>(value);
+ 
+     if constexpr (sizeof(T) > 4)
+     {
+-        matrix8[64 * 7 + col] = value8[7];
+-        matrix8[64 * 6 + col] = value8[6];
+-        matrix8[64 * 5 + col] = value8[5];
+-        matrix8[64 * 4 + col] = value8[4];
++        matrix8[64 * 7 + col] = static_cast<UInt8>(uvalue >> (8 * 7));
++        matrix8[64 * 6 + col] = static_cast<UInt8>(uvalue >> (8 * 6));
++        matrix8[64 * 5 + col] = static_cast<UInt8>(uvalue >> (8 * 5));
++        matrix8[64 * 4 + col] = static_cast<UInt8>(uvalue >> (8 * 4));
+     }
+ 
+     if constexpr (sizeof(T) > 2)
+     {
+-        matrix8[64 * 3 + col] = value8[3];
+-        matrix8[64 * 2 + col] = value8[2];
++        matrix8[64 * 3 + col] = static_cast<UInt8>(uvalue >> (8 * 3));
++        matrix8[64 * 2 + col] = static_cast<UInt8>(uvalue >> (8 * 2));
+     }
+ 
+     if constexpr (sizeof(T) > 1)
+-        matrix8[64 * 1 + col] = value8[1];
++        matrix8[64 * 1 + col] = static_cast<UInt8>(uvalue >> (8 * 1));
+ 
+-    matrix8[64 * 0 + col] = value8[0];
++    matrix8[64 * 0 + col] = static_cast<UInt8>(uvalue);
+ }
+ 
+ template <typename T>

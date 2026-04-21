@@ -1698,6 +1698,64 @@ fix, the server failed startup with `NoSuchBucket` and zero tests ran.
 
 ### Next Steps
 
-- Patch 0105 (T64 signed transpose) — investigation in progress; test-failure pattern (`1 1 1 0 1 0 1 0` for value=1 columns of signed types) and CompressionCodecT64.cpp `transposeBytes`/`reverseTransposeBytes` byte-aliasing analysis suggest the bug is in the load/store asymmetry plus byte-aliasing in `transposeBytes`. Not yet a single-line fix.
 - Investigate `02935_ipv6_bit_operations` (different shape from wide-integer JIT)
 - Investigate `01554_bloom_filter_index_big_integer_uuid`
+
+## Patch 0105 — T64 `transposeBytes` byte-aliasing fix (2026-04-21)
+
+**File:** `patches/0105-fix-t64-transpose-bytes-endianness.patch`
+**Build:** clickhouse 26.2.4.23 with 0100+0101+0102v3+0103v6+0104+0105+0106 (store path `gnxsyd727fzzs3knz4s4dnxs0k0p1ngh`).
+
+### Root cause
+
+`transposeBytes<T>` extracted the k-th byte via memory aliasing
+(`value8[k] = reinterpret_cast<UInt8*>(&value)[k]`), which on BE is
+the k-th **most**-significant byte. `reverseTransposeBytes<T>` used
+arithmetic shifts (`matrix8[64*k+col] << (8*k)`), which always
+addresses the k-th **least**-significant byte. Agreement on LE,
+inversion on BE.
+
+Combined with 0101's `unalignedLoadLittleEndian` in `load()` (which
+byte-swaps the column buffer into a logical LE value), a T64
+round-trip on s390x silently reversed bytes within each value:
+`UInt16 256 (0x0100)` decoded to `1 (0x0001)`, `512` to `2`, and the
+signed multi-column `(1,1,1,1,1,1,1,1)` pattern decoded to
+`1 1 1 0 1 0 1 0`.
+
+### Fix
+
+Make `transposeBytes` shift-based and value-preserving, symmetric
+with `reverseTransposeBytes`:
+
+```cpp
+using U = std::make_unsigned_t<T>;
+const U uvalue = static_cast<U>(value);
+matrix8[64 * k + col] = static_cast<UInt8>(uvalue >> (8 * k));
+```
+
+On LE the compiler lowers this to the same byte-load as the memory
+aliasing did, so codegen is unchanged on the common path.
+
+### Verification
+
+Direct round-trip on z:
+
+```
+INSERT INTO t1 VALUES (0),(256),(512) → 0, 256, 512   (was: 0, 1, 2)
+INSERT INTO mc VALUES (1,1,1,1,1,1,1,1) → 1 1 1 1 1 1 1 1   (was: 1 1 1 0 1 0 1 0)
+```
+
+Official T64 tests against reference files:
+
+| Test | Status |
+|---|---|
+| `00870_t64_codec` | PASS |
+| `00871_t64_codec_signed` | PASS |
+| `00872_t64_bit_codec` | PASS |
+
+### Remaining T64-cluster risk
+
+The `restoreUpperBits` signed-path logic (upper_min / upper_max via
+`sign_bit`) is pure integer arithmetic and is endian-agnostic once
+the transpose is value-preserving. No further T64 changes needed for
+the scalar path.
