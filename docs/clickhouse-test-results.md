@@ -1759,3 +1759,30 @@ The `restoreUpperBits` signed-path logic (upper_min / upper_max via
 `sign_bit`) is pure integer arithmetic and is endian-agnostic once
 the transpose is value-preserving. No further T64 changes needed for
 the scalar path.
+
+## Run J — focused re-run of the 56 Run-I failures, with 0105 applied (2026-04-21)
+
+Strategy change: rather than re-run the full 135-test filter after every
+patch, feed `clickhouse-test` the exact list of tests that failed in the
+previous run. Iteration cycle drops from ~hour-scale to ~minutes.
+
+**Result:** **12 OK / 52 FAIL** (from 76 tests matched, since some filter
+names are regex prefixes that pull in siblings).
+
+### Cluster-level delta (Run I → Run J)
+
+| Cluster | Run I | Run J | Change |
+|---|---|---|---|
+| T64 codec | 4 FAIL | **0 FAIL** | +4 (0105) |
+| Other regex-match passes (01273_arrow, 03251_parquet_page_v2_native_reader) | — | OK | incidental |
+
+Two tests moved pass→fail (`01273_arrow_dictionaries_load`,
+`03036_test_parquet_bloom_filter_push_down_ipv6`) — both are settings-flaky
+(random settings vary per run), not a 0105 regression.
+
+### Next Steps
+
+- Parquet reader/writer cluster (~30 failures) — follow-up patches to
+  0102/0103 for the remaining LE sites.
+- `03456_wide_integer_cross_platform_consistency` / `03457_wide_integer_double_conversion_edge_cases` — investigate after Parquet cluster.
+- `02935_ipv6_bit_operations`, `01554_bloom_filter_index_big_integer_uuid` — standalone investigations.
