@@ -1786,3 +1786,78 @@ Two tests moved pass→fail (`01273_arrow_dictionaries_load`,
   0102/0103 for the remaining LE sites.
 - `03456_wide_integer_cross_platform_consistency` / `03457_wide_integer_double_conversion_edge_cases` — investigate after Parquet cluster.
 - `02935_ipv6_bit_operations`, `01554_bloom_filter_index_big_integer_uuid` — standalone investigations.
+
+---
+
+## Run K — full-suite attempt with 0105 applied (2026-04-21 → 2026-04-22)
+
+**Goal:** measure true whole-suite pass rate now that 0100/0101/0105 are in place, rather than re-running the focused 52-test filter.
+
+**Command:** `Z_HOST=z TEST_TIMEOUT=300 nix run .#test-clickhouse`
+
+**Outcome: suite aborted at ~33% coverage.**
+
+| Metric | Value |
+|---|---|
+| Tests completed before abort | ~1042 |
+| OK | 890 |
+| FAIL | 151 |
+| SKIPPED | 1 |
+| Partial pass rate | ~85.5% |
+
+### Why Run K terminated
+
+`clickhouse-test` sent itself SIGTERM after test
+`03801_merge_tree_on_readonly_disk` ran for 390 s, exceeding the
+`TEST_TIMEOUT=300` we set (previous runs used 600). Whole suite aborted
+during the cleanup phase of that test — none of the 52 Run-J failures
+were reached (all live in the 02700+ Parquet cluster). **Lesson: keep
+`TEST_TIMEOUT` at ≥600 s for z15; a single slow test shouldn't be able
+to kill the runner, but the current clickhouse-test implementation does
+abort on per-test timeout.**
+
+### Failure breakdown (151 fails, all NEW — none overlap Run J's 52)
+
+| Bucket | Count | Notes |
+|---|---|---|
+| `return code: 1` | 94 | Mostly test-infrastructure issues: missing keeper, missing RBAC rules, zookeeper-dependent tests, distributed clusters not defined, `user_files` path mismatch (tests expect `/var/lib/clickhouse/user_files/`, server uses `/tmp/ch-test-server/user_files/`) |
+| `result differs` | 31 | Mix of real s390x endianness bugs + environment-sensitive query log / settings tests |
+| `having stderror` | 18 | Server emits warnings the test doesn't mask (e.g. OpenTelemetry, ORC segfault test 03595) |
+| `Timeout` | 8 | z15 is genuinely slower for some heavy tests (backup, parallel-replica deadlock) |
+
+### NEW endianness-bug candidates (result-differs cluster)
+
+These differ in a way that strongly suggests byte-order bugs, not environment issues:
+
+| Test | Symptom | Suspected subsystem |
+|---|---|---|
+| `03727_prewhere_intermediate_columns` | Expected `60 70 80 90 0 10…`; got `720575940379279360 1441151880758558720…` — literal `(value << 56)` pattern | UInt64 byte-swap somewhere in PREWHERE intermediate column materialisation |
+| `00945_bloom_filter_index` | ~220 rows of expected data replaced by `0` | Bloom-filter lookup returning no matches — hash function or filter-bits endianness |
+| `03448_analyzer_skip_index_and_lambdas` | `Granules: 0/4` where `1/4` expected | `bloom_filter` skip-index granule match rate = 0 |
+| `03826_array_join_in_bloom_filter` | result-differs (present in run-k fail list) | Likely same bloom-filter cluster |
+| `02935_ipv6_bit_operations` | `1111…0000…` vs `0000…1111…` (byte-reversed) | IPv6 bit-shift/mask path — known from Run I |
+| `02133_classification` | Language classifier returns `un` instead of `ru/en/fr`; partial dict output | CLD3 / language-detector model tables likely contain LE-encoded weights |
+| `03408_parquet_row_group_profile_events` | Empty result | Parquet cluster (already in 0102/0103 scope) |
+
+The new `03727` prewhere finding is the most actionable single bug — the `value << 56` pattern is exactly what happens when a UInt64 on big-endian gets interpreted as though its bytes are in little-endian order, i.e. a missing `unalignedLoadLittleEndian` somewhere in prewhere column deserialization.
+
+### Test-infrastructure gaps exposed (not s390x bugs)
+
+Most of the 94 "return code: 1" failures are fixable without code changes — they're missing infrastructure in our deploy.nix test harness:
+
+1. **No embedded keeper** → all `_zookeeper_long`, `_rmt`, `_keeper_map`, `replicated_*` tests fail instantly (~40 tests)
+2. **No test clusters defined** → `test_cluster_two_shards`, `test_cluster_one_shard_two_replicas`, etc. (see plan `breezy-stirring-snail.md` A3)
+3. **`user_files` path mismatch** → ~5 tests hardcode `/var/lib/clickhouse/user_files/` in their `.sh` files; need either a symlink or an override
+4. **Missing RBAC rows** → some tests `GRANT` against unpopulated `system.users`
+5. **No S3/MinIO for some backup tests** → backup/restore family
+
+The plan in `breezy-stirring-snail.md` already enumerates these as Cycle A. Applying Cycle A should recover most of the 94, bringing whole-suite pass rate from ~85% to a projected ~90%+.
+
+### Next Steps (post-Run-K)
+
+1. **Relaunch with `TEST_TIMEOUT=600`** to measure complete suite pass rate.
+2. **Apply deploy.nix Cycle A changes** (keeper, clusters, `user_files` fix) — plan already drafted in `breezy-stirring-snail.md`.
+3. **Investigate `03727_prewhere_intermediate_columns`** — the clearest new endianness hit; likely a small patch.
+4. **Investigate bloom-filter cluster** (`00945`, `03448`, `03826`) as a group — probably a single endianness site in `BloomFilter.cpp` hash or bit-packing.
+5. **Defer `02133_classification`** until CLD model files confirmed to be the root cause (lower priority).
+
