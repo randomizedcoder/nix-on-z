@@ -1,0 +1,43 @@
+copying path '/nix/store/fvb3fhm8c193i6692v5223bxpa5w2nv7-source' from 'https://cache.nixos.org'...
+Running ClickHouse tests on z...
+  Per-test timeout: 600 sec
+Starting minio S3 server...
+curl: (7) Failed to connect to 127.0.0.1 port 9001 after 0 ms: Could not connect to server
+Minio running (PID 1563573) on http://127.0.0.1:9001
+Starting ClickHouse test server (with embedded keeper)...
+Processing configuration file '/tmp/ch-test-server/config.xml'.
+Logging information to /tmp/ch-test-server/log/clickhouse-server.log
+Logging errors to /tmp/ch-test-server/log/clickhouse-server.err.log
+ERROR: Server failed to start. Log:
+2026.04.22 23:08:14.322323 [ 1564198 ] {} <Information> RaftInstance: end of asio worker thread nuraft_w_14, remaining threads: 2
+2026.04.22 23:08:14.322329 [ 1564194 ] {} <Information> RaftInstance: end of asio worker thread nuraft_w_11, remaining threads: 1
+2026.04.22 23:08:14.322338 [ 1564197 ] {} <Information> RaftInstance: end of asio worker thread nuraft_w_15, remaining threads: 0
+2026.04.22 23:08:14.322392 [ 1563594 ] {} <Information> KeeperLogStore: Changelog is shut down
+2026.04.22 23:08:14.322410 [ 1563594 ] {} <Information> DiskObjectStorage(s3_disk): Destroying disk s3_disk
+2026.04.22 23:08:14.323450 [ 1563594 ] {} <Information> Application: Shutting down storages.
+2026.04.22 23:08:14.328358 [ 1563594 ] {} <Information> Application: Waiting for background threads
+2026.04.22 23:08:14.343047 [ 1563594 ] {} <Information> Application: Background threads finished in 14 ms
+2026.04.22 23:08:14.343367 [ 1563594 ] {} <Error> Application: Code: 568. DB::Exception: Cannot create interserver listener on port 9234 after trying both IPv6 and IPv4. (RAFT_ERROR), Stack trace (when copying this message, always include the lines below):
+
+0. Poco::Exception::Exception(String const&, int) @ 0x000000002211e7c4
+1. DB::Exception::Exception(DB::Exception::MessageMasked&&, int, bool) @ 0x0000000010fcf5fa
+2. DB::Exception::Exception(String&&, int, String, bool) @ 0x0000000007cafa5c
+3. DB::Exception::Exception(PreformattedMessage&&, int) @ 0x0000000007caf5d2
+4. DB::Exception::Exception<int>(int, FormatStringHelperImpl<std::type_identity<int>::type>, int&&) @ 0x0000000009190cb8
+5. DB::KeeperServer::launchRaftServer(Poco::Util::AbstractConfiguration const&, bool) @ 0x000000001cf8b768
+6. DB::KeeperServer::startup(Poco::Util::AbstractConfiguration const&, bool) @ 0x000000001cf8d4a2
+7. DB::KeeperDispatcher::initialize(Poco::Util::AbstractConfiguration const&, bool, bool, std::shared_ptr<DB::Macros const> const&) @ 0x000000001cf53ace
+8. DB::Context::initializeKeeperDispatcher(bool) const @ 0x0000000017a5db12
+9. DB::Server::main(std::vector<String, std::allocator<String>> const&) @ 0x00000000113c4968
+10. Poco::Util::Application::run() @ 0x000000002223ca8a
+11. DB::Server::run() @ 0x00000000113b15d6
+12. mainEntryClickHouseServer(int, char**) @ 0x00000000113aea5e
+13. main @ 0x0000000007ca24c0
+14. __issignalingl @ 0x0000000000034a56
+15. __log1pl @ 0x0000000000034b46
+16. ? @ 0x0000000007c9f940
+ (version 26.2.4.23)
+2026.04.22 23:08:14.343399 [ 1563594 ] {} <Information> Application: shutting down
+2026.04.22 23:08:14.343428 [ 1563602 ] {} <Information> BaseDaemon: Stop SignalListener thread
+EXIT=1
+2026-04-22T16:08:24-07:00

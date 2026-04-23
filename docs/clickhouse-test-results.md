@@ -1861,3 +1861,233 @@ The plan in `breezy-stirring-snail.md` already enumerates these as Cycle A. Appl
 4. **Investigate bloom-filter cluster** (`00945`, `03448`, `03826`) as a group — probably a single endianness site in `BloomFilter.cpp` hash or bit-packing.
 5. **Defer `02133_classification`** until CLD model files confirmed to be the root cause (lower priority).
 
+---
+
+## Investigation: `03727_prewhere_intermediate_columns` (2026-04-23)
+
+**Goal:** root-cause the `(value << 56)` UInt64 result pattern observed in Run K.
+
+### Isolated reproduction
+
+Built a minimal debug server on z (port 19100, `/tmp/ch-debug-u64/`) that writes
+a 5-row UInt64 Parquet file with ClickHouse itself and reads it back with both
+v3 and legacy readers.
+
+```
+=== write parquet (UInt64 x = number*10, 5 rows) ===
+=== v3 read ===                === non-v3 read ===
+0                              0
+720575940379279360             10
+1441151880758558720            20
+2161727821137838080            30
+2882303761517117440            40
+```
+
+`720575940379279360 == 10 << 56` confirms the v3 reader is returning the
+little-endian byte pattern of `10` interpreted as a big-endian UInt64. The
+legacy Arrow-based reader returns correct values, which proves:
+
+1. **Patch 0103 (writer) is correct** — the file on disk is valid LE Parquet
+   (verified via `xxd`: byte 0 of the 8-byte value is `0x0a` for `10`).
+2. **Patch 0102 (reader) is incomplete** — something in the v3 reader path is
+   still bypassing the byteswap.
+
+### Root cause: uncovered "direct decompress into column" fast path
+
+`src/Processors/Formats/Impl/Parquet/Reader.cpp:1957-1968` contains an
+optimisation that decompresses a compressed PLAIN-encoded page directly into
+the target `IColumn`'s raw memory, skipping `PageDecoderInfo::decodeField` /
+`convertColumn` entirely — and with it skipping the byteswap that patch 0102
+already added.
+
+```cpp
+if (!has_filter && !page.is_dictionary_encoded && prev_value_idx == 0 &&
+    page.value_idx == page.num_values &&
+    page.codec != parq::CompressionCodec::UNCOMPRESSED)
+{
+    std::span<char> span;
+    if (column_info.decoder.canReadDirectlyIntoColumn(page.encoding, encoded_values_to_read, *subchunk.column, span))
+    {
+        if (span.size() != page.values_uncompressed_size)
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Unexpected uncompressed page size");
+        decompress(page.data.data(), page.data.size(), span.size(), page.codec, span.data());
+        return;
+    }
+}
+```
+
+`canReadDirectlyIntoColumn` (`Decoding.cpp:1010-1019`) returns true iff:
+encoding is `PLAIN`, a `fixed_size_converter` exists, physical type is not
+`BOOLEAN`, and the converter's `isTrivial()` is true (no type conversion
+needed). That matches virtually every fixed-width integer column written by a
+modern ClickHouse v3 writer.
+
+Because ClickHouse's default Parquet output codec is **`zstd`** (see
+`Core/SettingsChangesHistory.cpp:799`, `Core/FormatFactorySettings.h:1158`),
+practically every ClickHouse-produced Parquet file satisfies the `page.codec
+!= UNCOMPRESSED` guard and hits this fast path. The decompressed output is
+raw little-endian PLAIN bytes, written straight into a column whose memory is
+interpreted as big-endian native on s390x.
+
+### Why the UNCOMPRESSED case appeared broken too in early testing
+
+Initial concern was that uncompressed parquet also returned reversed values,
+which would contradict the `page.codec != UNCOMPRESSED` guard. On re-check:
+the debug script didn't force `output_format_parquet_compression_method`, so
+the file was in fact zstd-compressed. The guard does work correctly; the
+UNCOMPRESSED path routes through the already-patched `convertColumn` code.
+
+### Secondary sites on the same class of bug
+
+Two further "trivial-converter → memcpy directly into column" sites for the
+`BYTE_STREAM_SPLIT` encoding exist in `Decoding.cpp`:
+
+| Site | Context |
+|---|---|
+| `Decoding.cpp:948` | `ByteStreamSplitDecoder::decodeWithFilter` when `converter->isTrivial()` |
+| `Decoding.cpp:961` | `ByteStreamSplitDecoder::decodeNoFilter` when `converter->isTrivial()` |
+
+These de-interleave the split byte streams in little-endian order (stream 0 =
+LSB) directly into column memory. BYTE_STREAM_SPLIT is used primarily for
+`FLOAT`/`DOUBLE` columns, so bugs here surface on `Float64` Parquet rather
+than on the UInt64 test. Any patch must cover them if floating-point Parquet
+reads are to be trusted.
+
+### Summary table of uncovered direct-write sites in v3 reader
+
+| File:Line | Trigger | What it writes | Current patch 0102 coverage |
+|---|---|---|---|
+| `Reader.cpp:1965` (`decompress`) | PLAIN + trivial fixed-size converter + non-BOOLEAN + compressed codec + whole-page read + no filter | LE PLAIN bytes post-decompress | **Not covered** |
+| `Decoding.cpp:948` (BYTE_STREAM_SPLIT, filter) | BSS encoding + trivial converter + filter | De-interleaved LE bytes | **Not covered** |
+| `Decoding.cpp:961` (BYTE_STREAM_SPLIT, no filter) | BSS encoding + trivial converter | De-interleaved LE bytes | **Not covered** |
+| `Decoding.cpp:1289` (`memcpyIntoColumn`) | Generic trivial PLAIN copy | LE bytes | **Covered** (byteswap added by 0102) |
+| `Decoding.cpp:1312` (`convertIntColumnImpl`) | Width-converting int copy | LE ints | **Covered** (fromLittleEndian added by 0102) |
+
+### Proposed fix shape (for the next patch — 0107 or equivalent)
+
+The writer side is already correct; the fix is pure reader-side.
+
+1. **Primary** — after the `decompress(...)` call at `Reader.cpp:1965`, on
+   `std::endian::native == std::endian::big` perform an in-place byteswap of
+   the `span.data()` buffer in `fixed_size_converter->input_size`-byte units
+   (skip when input_size == 1). The converter already knows the element size.
+   A helper that takes a span and a stride fits cleanly here.
+2. **Secondary** — mirror the same post-pass byteswap at the BSS direct
+   writes in `Decoding.cpp:948` and `:961` (element size = `num_streams`,
+   which is 4 or 8 for Float/Double).
+3. **Alternative** — have `canReadDirectlyIntoColumn` simply return `false`
+   on BE targets; the `convertColumn` path already handles byteswap, at the
+   cost of one extra memcpy per page (acceptable tradeoff on s390x where
+   this reader is a hot path only for a niche user base). This is the
+   smaller / less risky patch; byteswap-in-place is more surgical.
+
+### Verification
+
+Repro script at `/tmp/debug-u64-parquet.sh` (local), scp'd to z and run
+stand-alone. After the fix, expected output is:
+
+```
+=== v3 read ===   === non-v3 read ===
+0                 0
+10                10
+20                20
+30                30
+40                40
+```
+
+### Run L — relaunch with `TEST_TIMEOUT=600` (2026-04-22)
+
+Relaunched the full suite as recommended by Run K's follow-up list:
+
+```
+Z_HOST=z TEST_TIMEOUT=600 nix run .#test-clickhouse
+```
+
+**Outcome: server startup failed at 23:08:14 with RAFT_ERROR (RaftInstance
+could not bind interserver port 9234).**
+
+```
+Code: 568. DB::Exception: Cannot create interserver listener on port 9234
+after trying both IPv6 and IPv4. (RAFT_ERROR)
+```
+
+Root cause: when Run K was terminated by its own SIGTERM cascade during the
+`03801_merge_tree_on_readonly_disk` cleanup, `clickhouse-test` did not reap
+the embedded keeper/server subprocess. The orphaned `clickhouse server` pid
+1400916 survived for ~17 hours still bound to ports 9000/9234, blocking the
+next run.
+
+Resolution: `kill -TERM` on the stale pid pair (1400909 watchdog + 1400916
+server), wait for socket release, relaunch. Port `9234` was the keeper RAFT
+interserver port, not the tcp/http port — worth remembering for future
+triage.
+
+**Test-infra improvement candidate:** `deploy.nix`'s `test-clickhouse` wrapper
+should probably `pkill -f "clickhouse server.*ch-test-server"` at start-of-run
+regardless of previous state. Adding this to the plan's Cycle A work.
+
+### Patch 0107 draft — disable direct-read paths on BE
+
+Committed to `patches/0107-fix-parquet-direct-read-endianness.patch`.
+
+**Approach:** disable the three fast paths on big-endian instead of adding
+an in-place post-pass byteswap. Safer (no risk of missing a byte width),
+smaller (three short guards), and leaves patch 0102's per-element byteswap
+as the sole LE→native conversion.
+
+Three hunks, all in `src/Processors/Formats/Impl/Parquet/Decoding.cpp`:
+
+| Hunk | Function | Guard added |
+|---|---|---|
+| 1 | `ByteStreamSplitDecoder::decodeWithFilter` line ≈926 | `if constexpr (native == big) if (input_size > 1) direct = false;` |
+| 2 | `ByteStreamSplitDecoder::decodeNoFilter` line ≈957 | `if constexpr (native == big) direct = false;` |
+| 3 | `PageDecoderInfo::canReadDirectlyIntoColumn` line ≈1010 | `if constexpr (native == big) if (fixed_size_converter->input_size > 1) return false;` |
+
+No change to `Reader.cpp` — the decompress-into-column fast path at line
+1965 is reached only if `canReadDirectlyIntoColumn()` returns true, so
+guarding that predicate is sufficient to route BE through the
+convertColumn code path already fixed by 0102.
+
+**Verification before build:**
+
+Dry-run against z's v26.2 source with 0102 pre-applied:
+
+```
+Hunk #1 succeeded at 945 (offset 21 lines).
+Hunk #2 succeeded at 983 (offset 21 lines).
+Hunk #3 succeeded at 1041 (offset 21 lines).
+```
+
+All three hunks apply cleanly; the +21 offset comes from 0102's prior
+additions earlier in the same file, which is expected.
+
+**Expected outcome after rebuild:**
+
+- Debug repro `/tmp/debug-u64-parquet.sh` should return 0,10,20,30,40 from
+  the v3 reader instead of 0, `10<<56`, `20<<56`, ...
+- `03727_prewhere_intermediate_columns` should pass.
+- Parquet v3 test cluster (`03408_parquet_row_group_profile_events` and
+  other "result differs" entries in Run K's 31-member bucket) should drop
+  substantially.
+- No impact on x86_64 (all guards are `std::endian::native == std::endian::big`
+  `if constexpr` branches, dead-code-eliminated on LE).
+
+**Not addressed by 0107:**
+
+- Bloom filter "0 rows" cluster (`00945`, `03448`, `03826`) — different
+  subsystem; needs a separate investigation in `BloomFilter.cpp` /
+  `MergeTreeIndexBloomFilter.cpp`.
+- Wide-integer cross-platform consistency tests (`03456`, `03457`).
+- `02935_ipv6_bit_operations` — IPv6 bit op endianness.
+- `02133_classification` — CLD3 language-model tables (lower priority).
+
+### Broader implication
+
+The prewhere test symptom was a lucky tell — the byte-reversed literal pattern
+`N << 56` is easy to spot. Many Parquet tests that compare row counts or sums
+rather than raw values would pass despite being silently corrupt (e.g. a SUM
+over a column read as byte-reversed UInt64 will produce nonsense but not
+trigger an assertion). So the true blast radius of this bug on s390x is
+larger than the ~7 visibly-failing v3-Parquet tests in Run K suggest — any
+downstream aggregate over ClickHouse-written Parquet is affected on BE.
+

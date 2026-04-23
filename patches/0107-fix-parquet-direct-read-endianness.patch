@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nix-on-z <nix-on-z@s390x>
+Date: Thu, 23 Apr 2026 00:00:00 +0000
+Subject: [PATCH] Fix Parquet native-reader direct-into-column paths on big-endian
+
+Patch 0102 added LE->native byteswap to the per-element convertColumn code
+path, but the Parquet V3 reader has three optimisation fast paths that
+bypass convertColumn entirely and write raw PLAIN / BYTE_STREAM_SPLIT bytes
+straight into IColumn's underlying storage.  On big-endian platforms those
+little-endian bytes are then interpreted as native big-endian words, so
+every multi-byte value comes out byte-reversed.
+
+Concretely, a UInt64 column written by ClickHouse itself (default codec
+zstd) and read back through the V3 reader returns `N << 56` instead of `N`,
+because:
+
+  Reader.cpp:readPage()
+      if (!has_filter && !page.is_dictionary_encoded && whole-page &&
+          page.codec != UNCOMPRESSED &&
+          decoder.canReadDirectlyIntoColumn(...))
+      {
+          decompress(page.data, ..., span);   // LE PLAIN bytes -> IColumn
+          return;                             // <-- skips convertColumn
+      }
+
+canReadDirectlyIntoColumn() returns true for PLAIN + trivial fixed-size
+converter, matching virtually every fixed-width int/float column that
+modern ClickHouse writes.  ClickHouse's default parquet output codec is
+zstd, so `page.codec != UNCOMPRESSED` is almost always satisfied and the
+fast path fires.
+
+Two BYTE_STREAM_SPLIT direct paths have the same shape: when the converter
+is trivial the split streams (stream 0 = LSB) are memcpy'd straight into
+native column memory, corrupting Float32 / Float64 on BE.
+
+Fix strategy: disable the three direct paths on big-endian targets by
+forcing `direct = false` / returning false from canReadDirectlyIntoColumn
+whenever the element width is > 1.  This routes BE through the already-
+patched convertColumn path (fixed by 0102).  The extra memcpy+byteswap
+cost only applies to s390x; LE targets are untouched at compile time.
+
+Alternative considered: in-place byteswap after decompress() in
+Reader.cpp:1965 plus similar post-passes at the BSS memcpy sites.  Not
+taken because the three-line `direct = false` approach is smaller, leaves
+the fully-validated convertColumn path in charge of LE decoding, and has
+no risk of missing a byte width.
+
+Observable failures resolved (all are "result differs" tests that write +
+read fixed-width Parquet through v3):
+  - 03727_prewhere_intermediate_columns    (UInt64 literal `N << 56` symptom)
+  - 03408_parquet_row_group_profile_events (empty result)
+  - assorted 02700+ parquet v3 tests producing byte-reversed sums/values
+    on s390x.
+
+No behaviour change on x86_64 (std::endian::native != std::endian::big
+branch is dead at compile time).
+---
+--- a/src/Processors/Formats/Impl/Parquet/Decoding.cpp
++++ b/src/Processors/Formats/Impl/Parquet/Decoding.cpp
+@@ -924,6 +924,13 @@
+             return;
+         }
+         bool direct = converter->isTrivial();
++        /// BYTE_STREAM_SPLIT stores stream 0 = LSB (little-endian).  The direct
++        /// fast path memcpy's the de-interleaved bytes straight into the column's
++        /// native storage, which byte-reverses every Float32 / Float64 on BE.
++        /// Fall back to converter->convertColumn() (byteswap aware via patch 0102).
++        if constexpr (std::endian::native == std::endian::big)
++            if (converter->input_size > 1)
++                direct = false;
+         temp_buffer.resize(num_values * num_streams);
+         char * to = temp_buffer.data();
+         requireRemainingBytes(num_values);
+@@ -955,6 +962,10 @@
+     void decodeNoFilter(size_t num_values, IColumn & col, size_t num_streams)
+     {
+         bool direct = converter->isTrivial();
++        /// See decodeWithFilter above: BSS direct path corrupts multi-byte
++        /// values on big-endian.  Route BE through convertColumn instead.
++        if constexpr (std::endian::native == std::endian::big)
++            direct = false;
+         char * to = nullptr;
+         if (direct)
+         {
+@@ -1009,6 +1020,15 @@
+
+ bool PageDecoderInfo::canReadDirectlyIntoColumn(parq::Encoding::type encoding, size_t num_values, IColumn & col, std::span<char> & out) const
+ {
++    /// On big-endian platforms the caller (Reader::readPage) decompresses the
++    /// PLAIN-encoded page directly into IColumn memory, skipping the per-element
++    /// LE->native byteswap that patch 0102 added in convertColumn.  Disable the
++    /// optimisation for multi-byte element widths so BE falls back to the
++    /// convertColumn code path.  Single-byte columns (e.g. UInt8) are unaffected
++    /// by byte order so the fast path remains available.
++    if constexpr (std::endian::native == std::endian::big)
++        if (fixed_size_converter && fixed_size_converter->input_size > 1)
++            return false;
+     if (encoding == parq::Encoding::PLAIN && fixed_size_converter && physical_type != parq::Type::BOOLEAN && fixed_size_converter->isTrivial())
+     {
+         chassert(col.sizeOfValueIfFixed() == fixed_size_converter->input_size);

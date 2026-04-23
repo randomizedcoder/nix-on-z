@@ -23232,3 +23232,5 @@ Process group 1558588 should be killed
   File "/home/linux1/clickhouse-tests/tests/clickhouse-test", line 5032, in signal_handler
     raise Terminated(signal)
 __main__.Terminated: 15
+EXIT=0
+2026-04-23T11:33:23-07:00
