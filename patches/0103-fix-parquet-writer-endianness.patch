@@ -8,8 +8,9 @@ little-endian byte order. The ClickHouse Parquet writer and Arrow's
 PlainEncoder write values in native byte order, which is wrong on
 big-endian (s390x).
 
-Arrow encoder.cc (3 sites):
+Arrow encoder.cc (4 sites):
 - UnsafePutByteArray: ByteArray length prefix (uint32) for plain encoding
+- DictEncoderImpl::WriteDict (primitive): dictionary int/float values
 - DictEncoderImpl::WriteDict (ByteArray): dictionary string lengths
 - PlainEncoder<DType>::Put(const T*, int): swap Int32/Int64/Float/Double columns
 
@@ -19,13 +20,10 @@ ClickHouse Write.cpp (4 sites):
 - Statistics::get min/max: toLittleEndian before memcpy
 - flushBloomFilters: toLittleEndian each UInt32 word before write
 
-Column data IS byte-swapped in v6: works with the reader patch's
-symmetric memcpyIntoColumn/indexImpl LE-swap. Together, BE produces
-spec-compliant LE Parquet files that round-trip correctly on BE.
-
 On little-endian (x86): all conversions are compile-time no-ops,
 producing identical generated code to the original.
 ---
+diff --git a/contrib/arrow/cpp/src/parquet/encoder.cc b/contrib/arrow/cpp/src/parquet/encoder.cc
 --- a/contrib/arrow/cpp/src/parquet/encoder.cc
 +++ b/contrib/arrow/cpp/src/parquet/encoder.cc
 @@ -43,6 +43,8 @@
@@ -38,7 +36,7 @@ producing identical generated code to the original.
  #include "parquet/exception.h"
  #include "parquet/platform.h"
 @@ -162,7 +164,9 @@
- 
+
    void UnsafePutByteArray(const void* data, uint32_t length) {
      DCHECK(length == 0 || data != nullptr) << "Value ptr cannot be NULL";
 -    sink_.UnsafeAppend(&length, sizeof(uint32_t));
@@ -48,16 +46,17 @@ producing identical generated code to the original.
      sink_.UnsafeAppend(data, static_cast<int64_t>(length));
      unencoded_byte_array_data_bytes_ += length;
    }
-@@ -201,6 +205,19 @@
+@@ -201,7 +205,21 @@
  template <typename DType>
  void PlainEncoder<DType>::Put(const T* buffer, int num_values) {
    if (num_values > 0) {
 -    PARQUET_THROW_NOT_OK(sink_.Append(buffer, num_values * sizeof(T)));
 +    if constexpr (std::endian::native != std::endian::little
-+                  && (sizeof(T) == 4 || sizeof(T) == 8)) {
++                  && (sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8)) {
 +      /// Parquet stores column data in little-endian; byteswap each value on BE.
 +      PARQUET_THROW_NOT_OK(sink_.Reserve(num_values * sizeof(T)));
-+      using UIntT = std::conditional_t<sizeof(T) == 4, uint32_t, uint64_t>;
++      using UIntT = std::conditional_t<sizeof(T) == 2, uint16_t,
++                    std::conditional_t<sizeof(T) == 4, uint32_t, uint64_t>>;
 +      for (int i = 0; i < num_values; ++i) {
 +        UIntT u;
 +        std::memcpy(&u, &buffer[i], sizeof(UIntT));
@@ -69,7 +68,26 @@ producing identical generated code to the original.
 +    }
    }
  }
-@@ -658,7 +675,9 @@
+
+@@ -651,6 +669,17 @@
+   // For primitive types, only a memcpy
+   DCHECK_EQ(static_cast<size_t>(dict_encoded_size_), sizeof(T) * memo_table_.size());
+   memo_table_.CopyValues(0 /* start_pos */, reinterpret_cast<T*>(buffer));
++#if !ARROW_LITTLE_ENDIAN
++  // Parquet stores dictionary values in little-endian byte order.
++  // After CopyValues writes native-order values, byteswap each to LE.
++  if constexpr (sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8) {
++    using UIntT = std::conditional_t<sizeof(T) == 2, uint16_t,
++                  std::conditional_t<sizeof(T) == 4, uint32_t, uint64_t>>;
++    auto* p = reinterpret_cast<UIntT*>(buffer);
++    for (int64_t i = 0; i < memo_table_.size(); ++i)
++      p[i] = bit_util::ByteSwap(p[i]);
++  }
++#endif
+ }
+
+ // ByteArray and FLBA already have the dictionary encoded in their data heaps
+@@ -658,7 +687,9 @@
  void DictEncoderImpl<ByteArrayType>::WriteDict(uint8_t* buffer) const {
    memo_table_.VisitValues(0, [&buffer](::std::string_view v) {
      uint32_t len = static_cast<uint32_t>(v.length());
@@ -80,6 +98,7 @@ producing identical generated code to the original.
      buffer += sizeof(len);
      memcpy(buffer, v.data(), len);
      buffer += len;
+diff --git a/src/Processors/Formats/Impl/Parquet/Write.cpp b/src/Processors/Formats/Impl/Parquet/Write.cpp
 --- a/src/Processors/Formats/Impl/Parquet/Write.cpp
 +++ b/src/Processors/Formats/Impl/Parquet/Write.cpp
 @@ -7,6 +7,7 @@

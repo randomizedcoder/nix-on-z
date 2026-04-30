@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nix-on-z <nix-on-z@s390x>
+Date: Mon, 28 Apr 2026 00:00:00 +0000
+Subject: [PATCH] Fix Parquet dictionary index double-byteswap on big-endian
+
+When a Parquet column has a narrowing conversion (e.g. physical INT32 ->
+logical UINT_16), IntConverter::isTrivial() returns false, so
+Dictionary::decode takes the decode_generic path. This calls
+IntConverter::convertColumn -> convertIntColumnImpl, which (after patch
+0110) correctly does fromLittleEndian() before the narrowing cast.
+The result is native-endian values stored in the dictionary column.
+
+Dictionary then sets mode=FixedSize with value_size=2 and data pointing
+into the column's native-endian buffer.
+
+On lookup, indexImpl<2> copies these already-native 2-byte values and
+then unconditionally byteswaps them (assuming LE dictionary data),
+producing a double-swap. For value 1: native UInt16 0x0001 (bytes
+00 01 on BE) -> byteswap -> 0x0100 = 256.
+
+Fix: add a `swap_endian` parameter to indexImpl. In Dictionary::index,
+pass `col == nullptr` -- when col is null, dictionary data is raw LE
+bytes from the Parquet page (trivial path) and needs swapping. When
+col is set, data came from decode_generic and is already native.
+
+On little-endian: the entire if-constexpr block compiles away, so the
+new parameter has zero cost.
+
+Fixes: UInt16/Int16 Parquet round-trip returning value*256 on s390x.
+
+NOTE: Requires patches 0102 (indexImpl byteswap) and 0110
+(convertIntColumnImpl fromLittleEndian).
+---
+diff --git a/src/Processors/Formats/Impl/Parquet/Decoding.cpp b/src/Processors/Formats/Impl/Parquet/Decoding.cpp
+--- a/src/Processors/Formats/Impl/Parquet/Decoding.cpp
++++ b/src/Processors/Formats/Impl/Parquet/Decoding.cpp
+@@ -1271,7 +1271,7 @@
+ }
+
+ template<size_t value_size>
+-static void indexImpl(const PaddedPODArray<UInt32> & indexes, std::span<const char> data, std::span<char> to)
++static void indexImpl(const PaddedPODArray<UInt32> & indexes, std::span<const char> data, std::span<char> to, bool swap_endian = true)
+ {
+     size_t size = indexes.size();
+     for (size_t i = 0; i < size; ++i)
+@@ -1279,6 +1279,7 @@
+     /// Parquet stores column data in little-endian; swap to native on BE after the gather memcpy.
+     if constexpr (std::endian::native != std::endian::little
+                   && (value_size == 2 || value_size == 4 || value_size == 8))
++    if (swap_endian)
+     {
+         using U = std::conditional_t<value_size == 2, uint16_t, std::conditional_t<value_size == 4, uint32_t, uint64_t>>;
+         auto * p = reinterpret_cast<U *>(to.data());
+@@ -1295,15 +1296,19 @@
+         {
+             auto to = out.insertRawUninitialized(indexes.size());
+             chassert(to.size() == value_size * indexes.size());
++            /// When col is set, dictionary data was produced by decode_generic and is
++            /// already in native byte order; skip the LE->native byteswap in indexImpl.
++            /// When col is null, data points to raw LE bytes from the Parquet page.
++            bool swap = (col == nullptr);
+             /// Short variable-length memcpy is very slow compared to a simple mov, so we dispatch
+             /// to specialized loops covering basic int types.
+             switch (value_size)
+             {
+-                case 1: indexImpl<1>(indexes, data, to); break;
+-                case 2: indexImpl<2>(indexes, data, to); break;
++                case 1: indexImpl<1>(indexes, data, to, swap); break;
++                case 2: indexImpl<2>(indexes, data, to, swap); break;
+                 case 3: indexImpl<3>(indexes, data, to); break;
+-                case 4: indexImpl<4>(indexes, data, to); break;
+-                case 8: indexImpl<8>(indexes, data, to); break;
++                case 4: indexImpl<4>(indexes, data, to, swap); break;
++                case 8: indexImpl<8>(indexes, data, to, swap); break;
+                 case 16: indexImpl<16>(indexes, data, to); break;
+                 default:
+                     for (size_t i = 0; i < indexes.size(); ++i)

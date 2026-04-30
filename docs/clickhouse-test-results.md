@@ -2091,3 +2091,426 @@ trigger an assertion). So the true blast radius of this bug on s390x is
 larger than the ~7 visibly-failing v3-Parquet tests in Run K suggest — any
 downstream aggregate over ClickHouse-written Parquet is affected on BE.
 
+---
+
+## Post-0107 Diagnostic (2026-04-24)
+
+After patch 0107 was committed, wired into z's `generic.nix`, and the
+clickhouse store path rebuilt as `fac72ifl90957q79wcan0z1djggpf8cx`, the
+debug repro `/tmp/debug-u64-parquet.sh` was re-run on z. **The bug
+persists**: the v3 reader still returns `720575940379279360` (= `10 << 56`)
+for value 10. Investigation followed.
+
+### Patches confirmed in binary
+
+Disassembly of `/home/linux1/nixpkgs/result/bin/clickhouse` (the new build)
+shows that **both 0102 and 0107 code is present**:
+
+- `_ZNK2DB7Parquet15PageDecoderInfo25canReadDirectlyIntoColumn...` at
+  `0x1ce0cfc0` contains my BE-only check at `0x1ce0d002`:
+  `clgijh %r0,1,...` (= "if `fixed_size_converter->input_size > 1` return
+  false"). 0107's PLAIN-direct-path block is in the binary.
+- `_ZN2DB7Parquet16memcpyIntoColumn...` at `0x1ce0f100` contains the
+  case-2/4/8 byteswap loops generated from 0102's hunk #14 (`strvh`
+  unrolled at `0x1ce0f1d0-0x1ce0f1e2`, `strv`/`strvg` later in the function
+  body).
+- `_ZN2DB7Parquet10Dictionary5index...` at `0x1ce0e440` (size 0xc94)
+  contains case-2 (`strvh` at `0x1ce0ed68-0x1ce0ed7a`), case-4 (`strv` at
+  `0x1ce0eecc-0x1ce0eede`), and case-8 (`strvg` at `0x1ce0f062-0x1ce0f074`)
+  byteswap loops, generated from 0102's hunk #13 (`indexImpl<N>` template).
+- The value-size jump table at `0x3c8e890` shows entry 7 (= value_size 8)
+  resolves to `0x1ce0ef18` — and `0x1ce0ef18..0x1ce0f0a8` is the
+  patched case-8 handler containing the gather memcpy followed by the
+  unrolled `strvg` byteswap loop.
+
+So the patched code is in the right place in the right function, reachable
+from the right dispatch — yet it apparently does not change the column
+memory at runtime.
+
+### Systematic test across element widths (UInt8/16/32/64)
+
+The most useful new diagnostic. Same dataset (5 rows, `number * 10`),
+default writer settings (uses dict encoding):
+
+| Type   | v3 result                                | Pattern           | non-v3 result | Pattern (non-v3) |
+|--------|------------------------------------------|-------------------|---------------|------------------|
+| UInt8  | 0,10,20,30,40                            | correct           | 0,10,20,30,40 | correct          |
+| UInt16 | 0, 2560, 5120, 7680, 10240               | `N << 8`          | 0,10,20,30,40 | correct          |
+| UInt32 | 0, 167772160, 335544320, 503316480, 671088640 | `N << 24`    | 0,10,20,30,40 | correct          |
+| UInt64 | 0, 720575940379279360, …                 | `N << 56`         | 0,10,20,30,40 | correct          |
+
+The dict-encoded v3 path is byte-reversed for **every** multi-byte width
+in lock step — exactly the "raw LE bytes interpreted as native BE" pattern.
+The non-v3 dict path works correctly for all widths.
+
+PLAIN-only (forced via `output_format_parquet_use_custom_encoder=1,
+output_format_parquet_max_dictionary_size=1`):
+
+| Type   | v3 result      | non-v3 result      |
+|--------|----------------|--------------------|
+| UInt64 | 0,10,20,30,40 (correct, 0107 + 0102 working) | 0, `10<<56`, … (broken) |
+
+**0107 fixed the v3 PLAIN path** as designed. **non-v3 PLAIN path is a
+new finding** — the legacy reader has its own unpatched site for fixed-size
+PLAIN columns.
+
+### Where the v3 dict bug must live
+
+For dict-encoded UInt64 (the failing case), the source path is:
+
+1. `Reader.cpp:1973` fast-path gate has `!page.is_dictionary_encoded` — does
+   not fire for dict pages, so 0107 is irrelevant here.
+2. `Reader.cpp:2009` calls `page.decoder->decode(...)` → indices column.
+3. `Reader.cpp:2010` calls `column.dictionary.index(indices_column_uint32,
+   *subchunk.column)` → `Dictionary::index` (case 8) → `indexImpl<8>` with
+   0102's byteswap loop.
+
+The disassembly confirms case-8 contains a 4×-unrolled gather (`lg + stg`)
+followed by a 4×-unrolled byteswap (`lg + strvg`), reachable through the
+jump table from `value_size = 8`. Yet the runtime output shows pre-byteswap
+bytes in the output column.
+
+Two remaining hypotheses:
+
+1. **Some other code path also writes the dict result.** A second site
+   silently overwrites the byteswapped bytes with raw LE before the column
+   is consumed. Suspects:
+   - The decoded `indices_column` is somehow *itself* the value column
+     (not just indices) for dict-encoded fixed-size pages on BE — but the
+     code reads as if there are always two distinct columns.
+   - Some prefetch / cache layer holds raw bytes and gets re-copied later.
+2. **The dict data is already in some non-LE state when it reaches
+   `indexImpl`.** If `Dictionary::data` were native-BE bytes (rather than
+   raw LE from the parquet page), the gather would copy native bytes, the
+   byteswap would *invert* them to LE, and reading the column as native BE
+   would produce exactly the `N << (8(N-1))` pattern observed.
+
+The codepath I have read (Decoding.cpp:1192–1198, "data = data_;") does
+not byteswap, but I have not exhaustively read the dict page decompression
+path or every place `Dictionary::data` is written.
+
+### Next decisive step
+
+The non-invasive diagnostics are exhausted. To distinguish between the
+remaining hypotheses, the next step is a tracer patch: replace the
+byteswap operation in 0102's `indexImpl<N>` with a uniquely identifiable
+non-identity transform (e.g. `p[i] ^= 0xDEADBEEFDEADBEEFULL`) and
+rebuild. The output of the dict-encoded v3 read on z then tells us
+unambiguously:
+
+- If the output is XOR-poisoned: `indexImpl<N>` *does* execute, and the
+  bug is hypothesis (1) — a second writer is overwriting the result.
+- If the output is unchanged (still `N << 56` for UInt64): `indexImpl<N>`
+  is being *bypassed* entirely and the byteswap site is dead at runtime
+  despite being live in the binary. Then the question becomes "what
+  actually writes the column for dict-encoded fixed-size pages on BE?"
+
+This costs one ~2-hour rebuild on z and would tell us which of the two
+hypotheses to investigate. Pausing pending direction.
+
+### Also still broken (separate path, separate patch)
+
+The non-v3 PLAIN reader for fixed-width ints on BE — visible in the
+table above. Not previously enumerated because the existing test suite
+runs default settings (which use dict encoding), masking the legacy
+reader's PLAIN bug behind the legacy reader's working dict path.
+A patch for that path will need to find the legacy `ParquetBlockInputFormat`
+fixed-size column path; not yet investigated.
+
+## Tracer-patch result (2026-04-25) — bug is in the *writer*, not the reader
+
+Patch `0108-tracer-indexImpl-poison.patch` (diagnostic-only, since reverted)
+replaced the `std::byteswap(p[i])` post-pass added by 0102 in
+`Decoding.cpp::indexImpl<N>` with `p[i] ^= U(0xDEADBEEFDEADBEEFULL)`.
+Rebuilt clickhouse on z and re-ran the UInt8/16/32/64 dict-encoded read tests.
+
+### Observed output (v3, dict-encoded)
+
+| Type    | Input | Got                    | Hex                  |
+|---------|-------|------------------------|----------------------|
+| UInt64  | 0     | 16045690984833335023   | `0xDEADBEEFDEADBEEF` |
+| UInt64  | 1     | 16045690984833335022   | `0xDEADBEEFDEADBEEE` |
+| UInt32  | 0     | 3735928559             | `0xDEADBEEF`         |
+| UInt32  | 10    | 3735928549             | `0xDEADBEE5`         |
+| UInt16  | 0     | 48879                  | `0xBEEF`             |
+| UInt16  | 10    | 48869                  | `0xBEE5`             |
+
+### Decisive conclusion
+
+The poison is XORed against the **small native-form input value**, not against
+the byte-reversed `N << 56` form we saw pre-tracer. That means: by the time
+`indexImpl<N>` runs the gather memcpy, the dictionary-page bytes in `data` are
+**already in native (BE) byte order**, not in spec-compliant LE.
+
+So 0102's read-side byteswap in `indexImpl<N>` was correctly applied to
+non-spec data — flipping native-BE back to LE — and that produced the
+`N << 56` corruption observed before. The reader is fine *if* the file is
+spec-compliant. The file isn't.
+
+### Root cause: missing writer byteswap in Apache Arrow contrib
+
+Patch 0103 (writer endianness) covers `PlainEncoder<DType>::Put` and
+`DictEncoderImpl<ByteArrayType>::WriteDict`, but **not** the primitive
+`DictEncoderImpl<DType>::WriteDict` at
+`contrib/arrow/cpp/src/parquet/encoder.cc:649-654`:
+
+```cpp
+template <typename DType>
+void DictEncoderImpl<DType>::WriteDict(uint8_t* buffer) const {
+  // For primitive types, only a memcpy
+  DCHECK_EQ(static_cast<size_t>(dict_encoded_size_), sizeof(T) * memo_table_.size());
+  memo_table_.CopyValues(0, reinterpret_cast<T*>(buffer));
+}
+```
+
+`memo_table_.CopyValues` writes each dict entry in native byte order. On s390x
+this produces a non-spec Parquet file: the *dict page* contains native-BE
+bytes while the *data pages* (PlainEncoder, fixed via 0103) and metadata are
+LE. That asymmetry is exactly what the test results show:
+
+- PLAIN-only files round-trip correctly (writer side already fixed).
+- Dict-encoded files round-trip wrong because writer side is unfixed.
+
+### Proposed fix (extend 0103, or add 0109)
+
+After `memo_table_.CopyValues(...)` in the primitive `WriteDict`, add a
+big-endian post-pass:
+
+```cpp
+if constexpr (std::endian::native != std::endian::little
+              && (sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8)) {
+    using U = std::conditional_t<sizeof(T) == 2, uint16_t,
+              std::conditional_t<sizeof(T) == 4, uint32_t, uint64_t>>;
+    auto * p = reinterpret_cast<U *>(buffer);
+    for (size_t i = 0; i < memo_table_.size(); ++i)
+        p[i] = std::byteswap(p[i]);
+}
+```
+
+This makes BE writes spec-compliant; the existing 0102 read-side byteswap
+remains correct unchanged. Extending 0103 keeps the symmetry comment block
+in 0103 honest ("symmetric counterpart to 0102").
+
+### Status
+
+- Tracer patch `patches/0108-tracer-indexImpl-poison.patch` is local-only,
+  reverted from z's nixpkgs. Kept on disk for historical reference; can be
+  deleted before next commit.
+
+## Patch 0103 v7 — Primitive DictEncoderImpl::WriteDict byteswap (2026-04-26)
+
+Extended patch 0103 with a new hunk: after `memo_table_.CopyValues()` writes
+native-order dictionary values into the output buffer, add a post-pass
+byteswap on big-endian:
+
+```cpp
+#if !ARROW_LITTLE_ENDIAN
+  if constexpr (sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8) {
+    using UIntT = std::conditional_t<sizeof(T) == 2, uint16_t,
+                  std::conditional_t<sizeof(T) == 4, uint32_t, uint64_t>>;
+    auto* p = reinterpret_cast<UIntT*>(buffer);
+    for (int64_t i = 0; i < memo_table_.size(); ++i)
+      p[i] = bit_util::ByteSwap(p[i]);
+  }
+#endif
+```
+
+**File**: `contrib/arrow/cpp/src/parquet/encoder.cc`, line 653 (after `CopyValues`)
+
+**Expected to fix**: all dict-encoded Parquet round-trip failures on BE — the
+tracer proved dictionary page bytes were in native BE order, causing the reader's
+0102 byteswap to flip already-correct values *back* to LE, producing the
+characteristic `N << (8*(sizeof(T)-1))` corruption pattern.
+
+Also added 2-byte type support to the PlainEncoder::Put hunk (was 4/8 only).
+
+**Build status**: patches apply cleanly; compile in progress on z (~2hr).
+
+## Patch 0109 — Fix bloom filter skip index serialization on big-endian (2026-04-26)
+
+Root cause: `MergeTreeIndexGranuleBloomFilter::deserializeBinary` and
+`serializeBinary` in `src/Storages/MergeTree/MergeTreeIndexBloomFilter.cpp`
+have an incomplete big-endian guard. The code structure is:
+
+```cpp
+if constexpr (std::endian::native == std::endian::big)
+    read_size = filter->getFilter().size() * sizeof(BloomFilter::UnderType);
+else
+    istr.readStrict(reinterpret_cast<char *>(filter->getFilter().data()), read_size);
+```
+
+On BE, the `if constexpr` branch recalculates the I/O size (for UInt64-word
+alignment) but the actual `readStrict`/`write` calls are in the `else` branch,
+so on s390x bloom filter data is **never read from or written to disk**. The
+bloom filter is populated correctly in memory during INSERT, but on restart or
+merge, the deserialized filter is all zeros — causing all granules to be
+skipped and queries to return empty results.
+
+**Fix**: Remove the `else`, making the I/O unconditional while keeping the BE
+size recalculation.
+
+**Expected to fix**: `00945_bloom_filter_index`, `03448_analyzer_skip_index_and_lambdas`,
+`03826_array_join_in_bloom_filter`, and possibly `01554_bloom_filter_index_big_integer_uuid`.
+
+**Build status**: patch 0109 not included in current build (0103 v7 build);
+will be included in next rebuild.
+
+## Patch 0110 — Fix Parquet reader Int32→UInt8/UInt16 narrowing on big-endian (2026-04-27)
+
+Root cause: `convertIntColumnImpl` in `Decoding.cpp` reads Parquet's physical
+Int32 values (little-endian on disk) via `memcpy` into a native `UInt32`, then
+narrows to the target type via `static_cast<To>`. On big-endian, `memcpy` of
+LE bytes `05 00 00 00` into UInt32 gives `0x05000000` (83886080), so
+`static_cast<UInt8>` takes the low byte `0x00` instead of `0x05`.
+
+Patch 0102 added `fromLittleEndian()` to most sites in Decoding.cpp but missed
+`convertIntColumnImpl`, which handles **all** Parquet Int32 → {U}Int{8,16} and
+Int32 → {U}Int64 conversions.
+
+**Fix**: One line — add `x = fromLittleEndian(x)` after memcpy, before the
+narrowing cast.
+
+**Verified**: Writing UInt32 values round-trips correctly (same physical width,
+no conversion). Writing Int32 and reading as Int32 also works. Only the
+narrowing path (Int32→smaller type) was broken.
+
+**Expected to fix**: All Parquet tests that write/read UInt8, Int8, UInt16, Int16
+columns. Both the v3 native reader and the Arrow reader were producing zeros
+for these types. The Arrow reader failure is a separate bug in the Arrow library's
+own Int32→UInt8 conversion (not fixed by this patch, but the v3 reader is the
+default).
+
+**Also discovered**: 17 of the "aggregation/endianness" failures (00017, 00031,
+00032, 00035, 00041, 00051, 00059, 00083, 00084, 00148, 00149, 00169, 00175,
+00178, 03595_extract_url_parameters) are NOT endianness bugs — they all fail
+with `Unknown table expression identifier 'test.hits'` because the `test.hits`
+benchmark dataset is not loaded. These are stateful tests that require the hits
+dataset.
+
+**Build status**: rebuilding with patches 0109 + 0110.
+
+## Patch 0111 — Fix Parquet dictionary index double-byteswap on big-endian (2026-04-28)
+
+Root cause: double byteswap for dictionary-encoded columns with narrowing
+conversions (e.g. Parquet physical INT32 → logical UINT_16).
+
+The data flow:
+1. `IntConverter::isTrivial()` returns false (because `output_size` is set)
+2. `Dictionary::decode` takes the `decode_generic` path
+3. `decode_generic` calls `IntConverter::convertColumn` → `convertIntColumnImpl`
+4. Patch 0110's `fromLittleEndian()` correctly converts LE→native, then
+   `static_cast<UInt16>` narrows → native UInt16 stored in dictionary
+5. Dictionary sets `mode=FixedSize`, `value_size=2`, data pointing to native buffer
+6. On lookup, `indexImpl<2>` copies 2-byte values then **byteswaps again**
+   (assuming LE dictionary data) → value * 256
+
+The `indexImpl` byteswap (from patch 0102) is correct when dictionary data is
+raw LE bytes (trivial case where `data = data_` from the Parquet page). But
+when `decode_generic` produced the data, values are already native-endian.
+
+**Fix**: Add `swap_endian` parameter to `indexImpl`. In `Dictionary::index`,
+pass `col == nullptr` — when col is null, data is raw LE (trivial path);
+when col is set, data came from `decode_generic` and is already native.
+
+**Discriminator**: `col` (a `ColumnPtr` member of Dictionary) is non-null
+only when `decode_generic` was used. In the trivial path, `col` stays null.
+
+**Expected to fix**: UInt16/Int16 Parquet round-trip (value * 256 symptom).
+UInt8/Int8 were not affected because `indexImpl<1>` has no byteswap.
+UInt32/Int32 were not affected because `isTrivial()` returns true for
+same-width conversions (no `output_size` set), so the trivial LE path is used.
+
+---
+
+## Run L — Parquet-targeted run with patches 0100–0111 (2026-04-30)
+
+**Build**: `/nix/store/113d1qbj4f8ajg0mab0bykpfh9nij1ky-clickhouse-26.2.4.23-stable`
+**Patches**: 0100–0107, 0109, 0110, 0111 (12 total)
+
+### Integer round-trip verification (clickhouse local)
+
+All integer types now round-trip correctly through Parquet:
+
+| Type   | Input     | Output    | Status |
+|--------|-----------|-----------|--------|
+| UInt8  | 0,1,2,3,4 | 0,1,2,3,4 | OK |
+| Int8   | 0,1,2,3,4 | 0,1,2,3,4 | OK |
+| UInt16 | 0,1,2,3,4 | 0,1,2,3,4 | OK (was value*256 before 0111) |
+| Int16  | 0,1,2,3,4 | 0,1,2,3,4 | OK |
+| UInt32 | 0,1,2,3,4 | 0,1,2,3,4 | OK |
+| Int32  | 0,1,2,3,4 | 0,1,2,3,4 | OK |
+| UInt64 | 0,1,2,3,4 | 0,1,2,3,4 | OK |
+| Int64  | 0,1,2,3,4 | 0,1,2,3,4 | OK |
+
+### Bloom filter tests (all pass)
+
+| Test | Status |
+|------|--------|
+| 00945_bloom_filter_index | OK |
+| 01554_bloom_filter_index_big_integer_uuid | OK |
+| 03448_analyzer_skip_index_and_lambdas | OK |
+| 03534_skip_index_bug89691 | OK |
+| 03826_array_join_in_bloom_filter | OK |
+
+### Parquet test suite results: 58 OK / 25 FAIL (70%)
+
+**Passing (58)**:
+00900_long_parquet_decimal, 00900_orc_arrow_parquet_maps,
+00900_orc_arrow_parquet_tuples, 00900_parquet_time_to_ch_date_time,
+01358_lc_parquet, 01429_empty_arrow_and_parquet,
+02241_parquet_bad_column, 02304_orc_arrow_parquet_string_as_string,
+02312_parquet_orc_arrow_names_tuples, 02481_parquet_int_list_multiple_chunks,
+02481_parquet_list_monotonically_increasing_offsets,
+02511_parquet_orc_missing_columns, 02513_parquet_orc_arrow_nullable_schema_inference,
+02518_parquet_arrow_orc_boolean_value, 02534_parquet_fixed_binary_array,
+02581_parquet_arrow_orc_compressions, 02595_orc_arrow_parquet_more_types,
+02716_parquet_invalid_date32, 02721_parquet_field_not_found,
+02725_parquet_preserve_order, 02841_parquet_filter_pushdown_bug,
+02845_parquet_odd_decimals, 02884_parquet_new_encodings,
+02874_parquet_multiple_batches_array_inconsistent_offsets,
+03036_parquet_arrow_nullable, 03036_test_parquet_bloom_filter_push_down_ipv6,
+03147_parquet_memory_tracking, 03164_adapting_parquet_reader_output_size,
+03215_parquet_index, 03251_parquet_page_v2_native_reader,
+03254_parquet_bool_native_reader, 03263_parquet_write_bloom_filter,
+03276_parquet_output_compression_level, 03285_orc_arrow_parquet_tuple_field_matching,
+03408_parquet_checksums, 03432_input_format_parquet_max_block_size_validation,
+03445_geoparquet, 03445_parquet_json_roundtrip,
+03525_parquet_string_enum, 03532_parquet_const,
+03541_geoparquet_write, 03567_parquet_encoder_decimal_stats_bug,
+03596_parquet_prewhere_page_skip_bug, 03604_parquet_many_files,
+03623_parquet_bool, 03624_parquet_row_number,
+03633_parquet_local_time, 03633_parquet_prewhere_not_bool,
+03681_parquet_uuid, 03720_parquet_single_thread_native_writer_ordering,
+03755_parquet_insert_with_batches, 03762_parquet_cast_to_json,
+03774_parquet_empty_tuple, 03788_parquet_writer_bad_bool,
+03807_parquet_reader_race_next_subgroup, 03821_parquet_multilple_where_column_usage,
+03905_parquet_writer_datetime64_overflow, 03914_parquet_v3_prewhere_non_bool_filter
+
+**Failing (25)** — categorized:
+
+| Category | Tests | Root Cause |
+|----------|-------|------------|
+| Parquet statistics endianness | 02841_parquet_filter_pushdown, 03036_test_parquet_bloom_filter_push_down, 03261_test_merge_parquet_bloom_filter_minmax_stats, 03262_test_parquet_native_reader_int_logical_type | `min_value > max_value` — column chunk statistics written in native byte order instead of LE |
+| S3/Named Collections | 03322_check_count_for_parquet_in_s3, 03723_parquet_prefetcher_read_big_at | Missing S3 config — infrastructure gap |
+| user_files path mismatch | 02242_arrow_orc_parquet_nullable_schema_inference, 02245_parquet_skip_unknown_type, 03701_parquet_conversion_to_datetime64 | Shell tests use `/var/lib/clickhouse/user_files/` but server config uses `/tmp/ch-test-server/user_files/` |
+| Data round-trip | 00900_long_parquet, 00900_long_parquet_load_2, 00900_orc_arrow_parquet_nested, 02588_parquet_bug, 02735_parquet_encoder, 02786_parquet_big_integer_compatibility, 02718_parquet_metadata_format | Various endianness issues in data or metadata |
+| Other/unknown | 03295_half_parquet, 03408_parquet_row_group_profile_events, 03531_check_count_for_parquet, 03548_parquet_missing_tuple_elements, 03571_geoparquet_nullable_bug, 03630_parquet_bool_bug, 03668_parquet_min_bytes_for_seek_zero, 03773_parquet_roundtrip_bug, 03793_parquet_complex_types_fix | Need individual investigation |
+
+### Key finding: Parquet statistics endianness bug
+
+The `min_value > max_value` errors confirm that Parquet **column chunk
+statistics** (min/max values in page headers and column metadata) are written
+in native byte order instead of little-endian. Example error:
+
+```
+Statistics have min_value > max_value: 4160815104 > 2482962432
+  in column chunk statistics for column 'uint16_logical'
+```
+
+These values are byte-swapped UInt16 stored as Int32:
+- 4160815104 = 0xF8000000 → LE UInt16 0x00F8 = 248 (should be min)
+- 2482962432 = 0x94000000 → LE UInt16 0x0094 = 148 (should be max... wait, reversed)
+
+This is the next bug to fix — the statistics writer in the custom Parquet
+writer (`Write.cpp`) or the Arrow encoder needs LE conversion for statistics.
+

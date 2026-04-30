@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nix-on-z <nix-on-z@s390x>
+Date: Sat, 26 Apr 2026 00:00:00 +0000
+Subject: [PATCH] Fix bloom filter skip index serialization on big-endian
+
+MergeTreeIndexGranuleBloomFilter::deserializeBinary and
+serializeBinary have an incomplete big-endian guard: the
+if constexpr (std::endian::native == std::endian::big) branch
+recalculates the I/O size but the actual readStrict/write calls
+are in the else branch, so on big-endian (s390x) bloom filter
+data is never read from or written to disk.
+
+Fix by always performing the I/O, keeping the BE size
+recalculation (which rounds up to full UInt64-word boundaries).
+
+On little-endian: no change -- the if constexpr branch is
+compiled out, so the generated code is identical.
+---
+diff --git a/src/Storages/MergeTree/MergeTreeIndexBloomFilter.cpp b/src/Storages/MergeTree/MergeTreeIndexBloomFilter.cpp
+--- a/src/Storages/MergeTree/MergeTreeIndexBloomFilter.cpp
++++ b/src/Storages/MergeTree/MergeTreeIndexBloomFilter.cpp
+@@ -92,10 +92,10 @@
+     for (auto & filter : bloom_filters)
+     {
+         filter->resize(bytes_size);
++        // On big-endian, the serialized size may differ due to UInt64-word alignment.
+         if constexpr (std::endian::native == std::endian::big)
+             read_size = filter->getFilter().size() * sizeof(BloomFilter::UnderType);
+-        else
+-            istr.readStrict(reinterpret_cast<char *>(filter->getFilter().data()), read_size);
++        istr.readStrict(reinterpret_cast<char *>(filter->getFilter().data()), read_size);
+     }
+ }
+ 
+@@ -110,10 +110,10 @@
+     size_t write_size = (bits_per_row * total_rows + atom_size - 1) / atom_size;
+     for (const auto & bloom_filter : bloom_filters)
+     {
++        // On big-endian, the serialized size may differ due to UInt64-word alignment.
+         if constexpr (std::endian::native == std::endian::big)
+             write_size = bloom_filter->getFilter().size() * sizeof(BloomFilter::UnderType);
+-        else
+-            ostr.write(reinterpret_cast<const char *>(bloom_filter->getFilter().data()), write_size);
++        ostr.write(reinterpret_cast<const char *>(bloom_filter->getFilter().data()), write_size);
+     }
+ }
+ 

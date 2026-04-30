@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nix-on-z <nix-on-z@s390x>
+Date: Sat, 26 Apr 2026 00:00:00 +0000
+Subject: [PATCH] Fix Parquet reader Int32->UInt8/UInt16 narrowing on big-endian
+
+convertIntColumnImpl in Decoding.cpp reads Parquet's physical Int32
+values (little-endian on disk) via memcpy into a native UInt32, then
+narrows to the target type via static_cast<To>. On big-endian, the
+memcpy produces a byte-swapped UInt32 (e.g., LE 0x05000000 for value
+5), so static_cast<UInt8> takes the low byte which is 0x00 instead of
+0x05.
+
+Patch 0102 added fromLittleEndian() to most sites in Decoding.cpp
+but missed convertIntColumnImpl, which handles all Parquet Int32 ->
+{U}Int{8,16} and Int32 -> {U}Int64 conversions.
+
+Fix: add fromLittleEndian(x) after memcpy, before the narrowing cast.
+
+On little-endian: fromLittleEndian() is a compile-time no-op.
+
+Fixes: all Parquet round-trip tests involving UInt8, Int8, UInt16, Int16
+columns returning 0 on s390x.
+
+NOTE: This patch must be applied after 0102 (which defines the
+fromLittleEndian helper in Decoding.cpp).
+---
+diff --git a/src/Processors/Formats/Impl/Parquet/Decoding.cpp b/src/Processors/Formats/Impl/Parquet/Decoding.cpp
+--- a/src/Processors/Formats/Impl/Parquet/Decoding.cpp
++++ b/src/Processors/Formats/Impl/Parquet/Decoding.cpp
+@@ -1362,6 +1362,7 @@
+         /// (Can't reinterpret_cast<const From *>(from_bytes) because pointer may be unaligned).
+         From x;
+         memcpy(&x, from_bytes + i * sizeof(From), sizeof(From));
++        x = fromLittleEndian(x);
+         to[i] = static_cast<To>(x);
+     }
+ }

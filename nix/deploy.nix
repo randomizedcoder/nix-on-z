@@ -480,6 +480,12 @@ REMOTE_SCRIPT
       sudo ip addr add 127.0.0.3/8 dev lo 2>/dev/null || true
       sudo ip addr add 127.0.0.4/8 dev lo 2>/dev/null || true
 
+      # Create user_files symlink — some test .sh scripts hardcode
+      # /var/lib/clickhouse/user_files/ for cp operations, but the server
+      # uses /tmp/ch-test-server/user_files/. The symlink bridges both paths.
+      sudo mkdir -p /var/lib/clickhouse
+      sudo ln -sfn /tmp/ch-test-server/user_files /var/lib/clickhouse/user_files
+
       # Write server config with query_log, clusters, and RBAC support
       cat > "$DATA_DIR/config.xml" <<'XMLEOF'
 <?xml version="1.0"?>
@@ -501,6 +507,7 @@ REMOTE_SCRIPT
     <listen_host>127.0.0.2</listen_host>
     <listen_host>127.0.0.3</listen_host>
     <listen_host>127.0.0.4</listen_host>
+    <listen_host>::1</listen_host>
     <mark_cache_size>5368709120</mark_cache_size>
     <max_concurrent_queries>1000</max_concurrent_queries>
 
@@ -683,6 +690,20 @@ REMOTE_SCRIPT
                 </replica>
             </shard>
         </test_cluster_multiple_nodes_all_unavailable>
+        <test_unavailable_shard>
+            <shard>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>127.0.0.99</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </test_unavailable_shard>
     </remote_servers>
 
     <keeper_server>
@@ -712,6 +733,7 @@ REMOTE_SCRIPT
     <macros>
         <replica>1</replica>
         <shard>01</shard>
+        <test>Hello, world!</test>
     </macros>
 
     <user_directories>
