@@ -2514,3 +2514,48 @@ These values are byte-swapped UInt16 stored as Int32:
 This is the next bug to fix — the statistics writer in the custom Parquet
 writer (`Write.cpp`) or the Arrow encoder needs LE conversion for statistics.
 
+## Patch 0112 — Fix Parquet statistics (min/max) parsing endianness (2026-05-01)
+
+Root cause: `IntConverter::convertField` reads Parquet column statistics
+(min_value, max_value) via `unalignedLoad` without byte-order conversion.
+The custom writer (`Write.cpp`) already correctly uses `toLittleEndian()` when
+writing statistics, so the file is correct — but the reader interprets LE
+bytes as native. Similarly, `FloatConverter::convertField` reads float/double
+statistics via `memcpy` without LE conversion.
+
+**Fix**:
+- `IntConverter::convertField`: wrap `unalignedLoad` with `fromLittleEndian()`
+  for 2, 4, and 8-byte integer statistics
+- `FloatConverter::convertField`: byteswap raw float/double bits via
+  uint32_t/uint64_t intermediary on big-endian
+
+**Build**: `/nix/store/k0qdfvk7m0mysi42bpbc69lb74mybrcj-clickhouse-26.2.4.23-stable`
+
+**Results**: Parquet suite now at 59 OK / 24 FAIL (71%, was 58/25).
+- **Fixed**: 03261_test_merge_parquet_bloom_filter_minmax_stats (was failing
+  due to integer statistics, now passing)
+- **Still failing**: 02841_parquet_filter_pushdown (Decimal32 statistics — the
+  Decimal path uses `BigEndianDecimalFixedSizeConverter` which handles BE
+  natively for data, but the statistics values stored by the CH writer may
+  need additional investigation)
+- **Arrow reader path failures** (~5 tests): tests that force or randomly get
+  `input_format_parquet_use_native_reader_v3=0` fail because the Arrow
+  library's own reader has unpatched BE bugs. The v3 native reader (default)
+  works correctly.
+
+### Key finding: Arrow reader is fundamentally broken on BE
+
+Tests that explicitly test `v3=false` (Arrow reader) show int8=0/-1 and
+uint16=0 for externally-generated Parquet files. This is a bug in the
+Apache Arrow C++ library's own Parquet reader, not in ClickHouse's native
+reader. The native v3 reader (default) reads all types correctly after
+our patches.
+
+Affected tests: 03262_test_parquet_native_reader_int_logical_type (first
+20 lines use Arrow, second 20 use v3), and any test where randomized
+settings pick `v3=false`.
+
+This is an upstream Arrow issue — fixing it would require patching
+`contrib/arrow/cpp/src/parquet/`. For now, the workaround is to ensure
+v3=true is always used on BE platforms.
+

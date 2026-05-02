@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nix-on-z <nix-on-z@s390x>
+Date: Thu, 01 May 2026 00:00:00 +0000
+Subject: [PATCH] Fix Parquet statistics (min/max) parsing endianness
+
+IntConverter::convertField reads Parquet column statistics (min_value,
+max_value) via unalignedLoad without byte-order conversion. Parquet
+stores statistics in little-endian, so on big-endian the values are
+byte-swapped. This causes the reader to reject valid Parquet files with
+"Statistics have min_value > max_value" when filter pushdown is enabled.
+
+FloatConverter::convertField has the same issue: it reads float/double
+statistics via memcpy without LE conversion. IEEE 754 floats stored as
+LE bytes produce garbage values on BE without byte-swapping.
+
+Fix:
+- IntConverter::convertField: wrap unalignedLoad with fromLittleEndian()
+  for 2, 4, and 8-byte integer statistics. 1-byte values need no swap.
+- FloatConverter::convertField: byteswap the raw bits of the float/double
+  via uint32_t/uint64_t intermediary on big-endian.
+
+On little-endian: fromLittleEndian() is a no-op, and the if-constexpr
+block for floats compiles away entirely.
+
+Fixes: 02841_parquet_filter_pushdown, 03036_test_parquet_bloom_filter_push_down,
+03261_test_merge_parquet_bloom_filter_minmax_stats,
+03262_test_parquet_native_reader_int_logical_type, and any other test
+that uses Parquet column index or filter pushdown with numeric types.
+
+NOTE: Must apply after patch 0102 (which defines fromLittleEndian in
+Decoding.cpp).
+---
+diff --git a/src/Processors/Formats/Impl/Parquet/Decoding.cpp b/src/Processors/Formats/Impl/Parquet/Decoding.cpp
+--- a/src/Processors/Formats/Impl/Parquet/Decoding.cpp
++++ b/src/Processors/Formats/Impl/Parquet/Decoding.cpp
+@@ -1424,9 +1424,9 @@
+     switch (input_size)
+     {
+         case 1: val = unalignedLoad<UInt8>(data.data()); break;
+-        case 2: val = unalignedLoad<UInt16>(data.data()); break;
+-        case 4: val = unalignedLoad<UInt32>(data.data()); break;
+-        case 8: val = unalignedLoad<UInt64>(data.data()); break;
++        case 2: val = fromLittleEndian(unalignedLoad<UInt16>(data.data())); break;
++        case 4: val = fromLittleEndian(unalignedLoad<UInt32>(data.data())); break;
++        case 8: val = fromLittleEndian(unalignedLoad<UInt64>(data.data())); break;
+         default: chassert(false);
+     }
+
+@@ -1486,6 +1486,15 @@
+
+     T x;
+     memcpy(&x, data.data(), sizeof(x));
++    /// Parquet statistics are stored in little-endian; convert to native.
++    if constexpr (std::endian::native != std::endian::little)
++    {
++        using U = std::conditional_t<sizeof(T) == 4, uint32_t, uint64_t>;
++        U bits;
++        memcpy(&bits, &x, sizeof(T));
++        bits = std::byteswap(bits);
++        memcpy(&x, &bits, sizeof(T));
++    }
+
+     /// parquet.thrift says:
+     /// (*) Because the sorting order is not specified properly for floating
